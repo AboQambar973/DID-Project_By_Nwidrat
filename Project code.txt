@@ -1,0 +1,3630 @@
+####################################################################################################
+# GULFTECH SOLUTIONS - DEFENSE-IN-DEPTH  |  IT 8505 GROUP PROJECT  |  EVE-NG CODE FILE  (rev. 2 - review fixes applied)
+# Contains ONLY configuration + test code. Theory/justification is in GulfTech_DiD_Project_Report.docx.
+####################################################################################################
+#
+# HOW TO USE
+#  1. Build the topology in EVE-NG as in Section 0 (node types + wiring table). Names match the corrected topology diagram.
+#  2. Paste the blocks in the ORDER of the deployment plan below; each block says  >>> DEVICE: <name>  (paste on that node only).
+#  3. IOS blocks start with STEP 0 (hostname + RSA key). WAIT for key generation to finish, then paste STEP 1.
+#  4. '!' lines are IOS/ASA comments, '#' lines are Linux comments - both are safe to paste.
+#  5. Section 9 holds the verification / attack / failover commands that generate the report screenshots.
+#
+# RECOMMENDED DEPLOYMENT ORDER  (verify each layer before moving to the next)
+#  A) ISP1, ISP2                         -> ping each ISP neighbour
+#  B) TACACS-SRV
+#  C) HQ-CORE-SW1, HQ-ACC-SW1, HQ-PSW    -> VLANs, trunks, DHCP leases
+#  D) ASA-FW1, then ASA-FW2              -> show failover (Active / Standby Ready)
+#  E) PRE-FLIGHT CRYPTO CHECK (Section 5a), then HQ-R1, DXB-R1, RUH-R1, DOH-R1 and the 3 branch switches
+#  F) DMZ-SRV, IDS-TAP-01, ATTACKER, INET-WEB, ADMIN-PC, *-USER-01, ROGUE-DEV, RND-PC, VPCS
+#  G) RBAC views on every router/switch (Section 7 - contains one manual 'enable view' step)
+#  H) Verification (Section 9)
+#
+# LAB CREDENTIALS (lab only - change for any real deployment)
+#  Local fallback : netadmin / GulfTechAdmin2026   noc / GulfTechNoc2026   auditor / GulfTechAudit2026
+#  Enable secret  : GulfTechEnable2026        TACACS+ key: GulfTechTacKey2026        ASA failover key: GulfTechFoKey2026
+#
+# IMAGE ASSUMPTIONS: routers = Cisco IOSv 15.9(3)M ; switches = Cisco IOSvL2 15.2 ; firewalls = Cisco ASAv 9.x ;
+#  servers = Ubuntu 22.04 ; attacker = Kali ; PCs = VPCS.
+#
+# ITEMS THAT MUST BE CONFIRMED AT RUNTIME (support depends on the exact image - record the outcome in the report)
+#  [R1] IKEv2 group 20 / integrity sha384 / esp-sha384-hmac / pfs group20   -> Section 5a pre-flight; fallback table provided
+#  [R2] 'ip verify source' (IP source guard), 'ip arp inspection validate', 'storm-control', SPAN on IOSvL2
+#  [R3] TACACS+ attribute cli-view-name -> does IOS place the TACACS user into the parser view?  (Section 9, Task 6, Test A)
+#       TACACS+ provides authentication + exec authorisation + accounting; the granular command restriction is done by
+#       IOS CLI parser views (it is NOT per-command TACACS authorisation).
+#  [R4] ASA NAT behaviour -> confirm with 'show nat detail' and 'packet-tracer' (Section 9, Task 5)
+#  [R5] ASA failover synchronisation and fail-over timing -> record the OBSERVED values
+#  [R6] CoPP ('control-plane service-policy') - skip if the image rejects it
+#
+# DESIGN SCOPE NOTES
+#  * IDS-TAP-01 is a PASSIVE IDS on a SPAN port: it detects and alerts; containment is done on the ASA ('shun').
+#  * Detection is custom Suricata RATE/PATTERN (threshold) based behaviour detection - it is NOT a full UEBA/AI product.
+#  * No DNS service exists in the lab (hosts use IPs), so no DHCP DNS option and no DNS ACL entries are configured.
+#  * The Internet-edge test portal runs real TLS on TCP/443 (openssl s_server).
+#  * The SSH client alias on the Linux hosts re-enables legacy algorithms ONLY as a lab compatibility workaround.
+
+
+####################################################################################################
+# SECTION 0 - TOPOLOGY, WIRING AND ADDRESSING SUMMARY
+####################################################################################################
+
+NODES  (names = topology diagram)
+  ISP1, ISP2, HQ-R1, DXB-R1, RUH-R1, DOH-R1 ................. IOSv   (ISP1 and ISP2 need >= 5 NICs)
+  HQ-CORE-SW1, HQ-ACC-SW1, HQ-PSW, DXB-SW1, RUH-SW1, DOH-SW1 ... IOSvL2
+  ASA-FW1, ASA-FW2 .......................................... ASAv   (NIC order: e0=Mgmt0/0, e1=Gi0/0, e2=Gi0/1, e3=Gi0/2, e4=Gi0/3)
+  TACACS-SRV, DMZ-SRV, IDS-TAP-01 (2 NICs), INET-WEB, ADMIN-PC, DXB-USER-01, RUH-USER-01, DOH-USER-01, RND-PC ... Linux
+  ATTACKER, ROGUE-DEV ....................................... Kali Linux
+  HR-PC, MKT-PC, SALES-PC (HQ and each branch) .............. VPCS
+  NET-INET .................................................. EVE-NG 'Network' object (bridge) joining ISP1-Gi0/4, ISP2-Gi0/4, ATTACKER, INET-WEB
+
+WIRING (A-side <-> B-side)
+  ISP1 Gi0/0 <-> HQ-R1 Gi0/1      ISP2 Gi0/0 <-> HQ-R1 Gi0/2
+  ISP1 Gi0/1 <-> DXB-R1 Gi0/1     ISP2 Gi0/1 <-> DXB-R1 Gi0/2
+  ISP1 Gi0/2 <-> RUH-R1 Gi0/1     ISP2 Gi0/2 <-> RUH-R1 Gi0/2
+  ISP1 Gi0/3 <-> DOH-R1 Gi0/1     ISP2 Gi0/3 <-> DOH-R1 Gi0/2
+  ISP1 Gi0/4, ISP2 Gi0/4, ATTACKER eth0, INET-WEB ens3 <-> NET-INET
+  HQ-R1 Gi0/0 <-> HQ-PSW Gi0/0                         (VLAN 900 outside / perimeter)
+  HQ-PSW Gi0/1 <-> ASA-FW1 Gi0/0 (e1, outside)         HQ-PSW Gi0/2 <-> ASA-FW2 Gi0/0 (e1, outside)
+  HQ-PSW Gi0/3 <-> ASA-FW1 Gi0/2 (e3, dmz)             HQ-PSW Gi1/0 <-> ASA-FW2 Gi0/2 (e3, dmz)
+  HQ-PSW Gi1/1 <-> DMZ-SRV ens3                        HQ-PSW Gi1/2 <-> IDS-TAP-01 ens3 (SPAN destination)
+  HQ-PSW Gi1/3 <-> HQ-CORE-SW1 Gi1/1                   (management uplink, VLAN 99)
+  ASA-FW1 Gi0/3 (e4) <-> ASA-FW2 Gi0/3 (e4)            (direct cable: LAN + stateful failover)
+  HQ-CORE-SW1 Gi0/0 <-> ASA-FW1 Gi0/1 (e2, inside)     HQ-CORE-SW1 Gi0/1 <-> ASA-FW2 Gi0/1 (e2, inside)   (VLAN 910)
+  HQ-CORE-SW1 Gi0/2 <-> HQ-ACC-SW1 Gi0/0 (trunk)       HQ-CORE-SW1 Gi0/3 <-> TACACS-SRV ens3 (VLAN 60)
+  HQ-CORE-SW1 Gi1/0 <-> ADMIN-PC ens3 (VLAN 99)        HQ-CORE-SW1 Gi1/2 <-> IDS-TAP-01 ens4 (VLAN 60)
+  HQ-ACC-SW1 Gi0/1 HR-PC | Gi0/2 MKT-PC | Gi0/3 SALES-PC | Gi1/0 RND-PC (VLAN 50) | Gi1/1 ROGUE-DEV (VLAN 30)
+  <BR>-R1 Gi0/0 <-> <BR>-SW1 Gi0/0 (trunk) ; <BR>-SW1 Gi0/1 HR-PC | Gi0/2 MKT-PC | Gi0/3 SALES-PC | Gi1/0 <BR>-USER-01 (VLAN 99)
+
+VLAN / SUBNET PLAN
+  HQ  VLAN10 HR 10.10.2.0/26 gw .1 | VLAN20 MKT 10.10.2.64/26 gw .65 | VLAN30 SALES 10.10.1.0/25 gw .1 | VLAN50 R&D 10.10.1.128/25 gw .129
+      VLAN60 SERVERS 10.10.2.128/27 gw .129 (TACACS-SRV .130, IDS-TAP-01 mgmt .140) | VLAN99 MGMT 10.10.2.160/27 gw .161 (ADMIN-PC .170)
+      VLAN100 DMZ 10.10.3.0/27 (ASA .1/.2, DMZ-SRV web .10 / mail .11) | VLAN910 FW-Transit 10.10.255.0/29 (HQ-CORE-SW1 .1, ASA .2/.3)
+      VLAN900 Outside 192.0.2.0/28 (ASA .1/.2, HQ-R1 .3, published web .10, mail .11) | FW failover link 10.255.254.0/30
+  DXB 10.20.0.0/16: SALES(30) 10.20.1.0/25 | MKT(20) 10.20.1.128/26 | HR(10) 10.20.1.192/26 | MGMT(99) 10.20.2.0/27
+  RUH 10.30.0.0/16: SALES(30) 10.30.1.0/25 | MKT(20) 10.30.1.128/26 | HR(10) 10.30.1.192/26 | MGMT(99) 10.30.2.0/27
+  DOH 10.40.0.0/16: SALES(30) 10.40.1.0/26 | MKT(20) 10.40.1.64/27  | HR(10) 10.40.1.96/27  | MGMT(99) 10.40.2.0/27
+  Loopbacks 10.255.0.1-4/32 | VPN tunnels ISP1 10.255.1.0/24 (/30 each) | ISP2 10.255.2.0/24 (/30 each)
+  WAN (only RFC 5737 blocks): ISP1 links in 198.51.100.0/24 -> HQ .0/30, DXB .4/30, RUH .8/30, DOH .12/30
+       ISP2 links in 192.0.2.16/28 -> HQ .16/30, DXB .20/30, RUH .24/30, DOH .28/30  (HQ perimeter VLAN 900 is 192.0.2.0/28)
+       each /30: ISP = first host, customer = second host ; Internet LAN (NET-INET) 203.0.113.0/24: ISP1 .1, ISP2 .2, ATTACKER .18, INET-WEB .19
+  Host addresses in the diagram are DHCP leases (first-free): HR-PC .19 (HQ), MKT-PC .66, SALES-PC .10, RND-PC .130, branch HR .194/.98, MKT .130/.66, SALES .10
+
+
+####################################################################################################
+# SECTION 1 - UNDERLAY (ISPs)
+####################################################################################################
+
+====================================================================================================
+>>> DEVICE: ISP1    PLATFORM: IOSv
+>>> Console of ISP1
+====================================================================================================
+hostname ISP1
+no ip domain-lookup
+interface GigabitEthernet0/0
+ description To-HQ-R1-Gi0/1
+ ip address 198.51.100.1 255.255.255.252
+ no shutdown
+interface GigabitEthernet0/1
+ description To-DXB-R1-Gi0/1
+ ip address 198.51.100.5 255.255.255.252
+ no shutdown
+interface GigabitEthernet0/2
+ description To-RUH-R1-Gi0/1
+ ip address 198.51.100.9 255.255.255.252
+ no shutdown
+interface GigabitEthernet0/3
+ description To-DOH-R1-Gi0/1
+ ip address 198.51.100.13 255.255.255.252
+ no shutdown
+interface GigabitEthernet0/4
+ description To-NET-INET (Internet LAN 203.0.113.0/24)
+ ip address 203.0.113.1 255.255.255.0
+ no shutdown
+! HQ public/perimeter prefix: primary via HQ-R1 (tracked), floating backup via ISP2 across NET-INET
+ip sla 1
+ icmp-echo 198.51.100.2 source-interface GigabitEthernet0/0
+ frequency 5
+ip sla schedule 1 life forever start-time now
+track 1 ip sla 1 reachability
+ip route 192.0.2.0 255.255.255.240 198.51.100.2 track 1
+ip route 192.0.2.0 255.255.255.240 203.0.113.2 250
+end
+write memory
+
+====================================================================================================
+>>> DEVICE: ISP2    PLATFORM: IOSv
+>>> Console of ISP2
+====================================================================================================
+hostname ISP2
+no ip domain-lookup
+interface GigabitEthernet0/0
+ description To-HQ-R1-Gi0/2
+ ip address 192.0.2.17 255.255.255.252
+ no shutdown
+interface GigabitEthernet0/1
+ description To-DXB-R1-Gi0/2
+ ip address 192.0.2.21 255.255.255.252
+ no shutdown
+interface GigabitEthernet0/2
+ description To-RUH-R1-Gi0/2
+ ip address 192.0.2.25 255.255.255.252
+ no shutdown
+interface GigabitEthernet0/3
+ description To-DOH-R1-Gi0/2
+ ip address 192.0.2.29 255.255.255.252
+ no shutdown
+interface GigabitEthernet0/4
+ description To-NET-INET (Internet LAN 203.0.113.0/24)
+ ip address 203.0.113.2 255.255.255.0
+ no shutdown
+ip sla 1
+ icmp-echo 192.0.2.18 source-interface GigabitEthernet0/0
+ frequency 5
+ip sla schedule 1 life forever start-time now
+track 1 ip sla 1 reachability
+ip route 192.0.2.0 255.255.255.240 192.0.2.18 track 1
+ip route 192.0.2.0 255.255.255.240 203.0.113.1 250
+end
+write memory
+
+
+####################################################################################################
+# SECTION 2 - SERVERS REQUIRED EARLY (AAA)
+####################################################################################################
+
+====================================================================================================
+>>> DEVICE: TACACS-SRV    PLATFORM: Linux (Ubuntu)
+>>> Terminal of TACACS-SRV
+====================================================================================================
+# --- Network (re-apply after every reboot; check NIC name with: ip -br link) ---
+sudo ip link set ens3 up
+sudo ip addr add 10.10.2.130/27 dev ens3
+sudo ip route add default via 10.10.2.129
+# --- One-time package install (temporarily connect a NAT/Cloud node, then remove it) ---
+sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tacacs+ rsyslog
+# --- TACACS+ daemon configuration ---
+sudo tee /etc/tacacs+/tac_plus.conf >/dev/null <<'EOF'
+key = GulfTechTacKey2026
+accounting file = /var/log/tac_plus.acct
+
+user = netadmin {
+    default service = permit
+    login = cleartext "GulfTechAdmin2026"
+    service = exec {
+        priv-lvl = 15
+    }
+}
+
+user = noc {
+    default service = permit
+    login = cleartext "GulfTechNoc2026"
+    service = exec {
+        priv-lvl = 1
+        cli-view-name = "NOC-VIEW"
+    }
+}
+
+user = auditor {
+    default service = permit
+    login = cleartext "GulfTechAudit2026"
+    service = exec {
+        priv-lvl = 1
+        cli-view-name = "AUDIT-VIEW"
+    }
+}
+EOF
+sudo touch /var/log/tac_plus.acct
+sudo systemctl restart tacacs_plus
+sudo systemctl enable tacacs_plus
+sudo systemctl status tacacs_plus --no-pager
+# If the service name differs on your image, run it in the foreground instead:
+#   sudo tac_plus -C /etc/tacacs+/tac_plus.conf -G &
+# Watch accounting records live:
+#   sudo tail -f /var/log/tac_plus.acct
+
+
+####################################################################################################
+# SECTION 3 - HQ SWITCHING FABRIC (Tasks 1, 2, 6)
+####################################################################################################
+
+====================================================================================================
+>>> DEVICE: HQ-CORE-SW1    PLATFORM: IOSvL2 (L3 switch)
+>>> Console of HQ-CORE-SW1
+====================================================================================================
+! ---- STEP 0 (paste, then WAIT for the key-generation to finish) ----
+enable
+configure terminal
+hostname HQ-CORE-SW1
+ip domain-name gulftech.local
+crypto key generate rsa modulus 2048
+! ---- STEP 1 (paste the rest) ----
+hostname HQ-CORE-SW1
+no ip domain-lookup
+ip domain-name gulftech.local
+service password-encryption
+service timestamps debug datetime msec localtime
+service timestamps log datetime msec localtime
+no service pad
+no ip http server
+no ip http secure-server
+no cdp run
+login block-for 120 attempts 3 within 60
+login on-failure log
+login on-success log
+logging buffered 32768 informational
+logging console critical
+enable secret GulfTechEnable2026
+username netadmin privilege 15 secret GulfTechAdmin2026
+banner motd ^C
+*************************************************************
+  GULFTECH SOLUTIONS - AUTHORISED ACCESS ONLY
+  All activity is logged (AAA accounting). Disconnect now if
+  you are not an authorised administrator.
+*************************************************************
+^C
+vtp mode transparent
+ip ssh version 2
+ip ssh time-out 60
+ip ssh authentication-retries 3
+spanning-tree mode rapid-pvst
+spanning-tree extend system-id
+spanning-tree portfast bpduguard default
+spanning-tree loopguard default
+errdisable recovery cause bpduguard
+errdisable recovery cause psecure-violation
+errdisable recovery cause storm-control
+errdisable recovery interval 300
+ip routing
+!
+interface Vlan99
+ description MANAGEMENT SVI
+ ip address 10.10.2.161 255.255.255.224
+ no shutdown
+vlan 10
+ name HR
+vlan 20
+ name MARKETING
+vlan 30
+ name SALES
+vlan 50
+ name RND-ISOLATED
+vlan 60
+ name SERVERS
+vlan 99
+ name MANAGEMENT
+vlan 910
+ name FW-INSIDE-TRANSIT
+vlan 998
+ name PARKING-BLACKHOLE
+vlan 999
+ name NATIVE-UNUSED
+spanning-tree vlan 10,20,30,50,60,99,910 priority 4096
+!
+! ---- SVIs (L3 gateways; inter-VLAN routing happens here) ----
+interface Vlan10
+ description HR gateway
+ ip address 10.10.2.1 255.255.255.192
+ no ip redirects
+ no ip proxy-arp
+interface Vlan20
+ description MARKETING gateway
+ ip address 10.10.2.65 255.255.255.192
+ no ip redirects
+ no ip proxy-arp
+interface Vlan30
+ description SALES gateway
+ ip address 10.10.1.1 255.255.255.128
+ no ip redirects
+ no ip proxy-arp
+interface Vlan50
+ description R&D gateway (ISOLATED - ACL RD-IN / RD-OUT)
+ ip address 10.10.1.129 255.255.255.128
+ ip access-group RD-IN in
+ ip access-group RD-OUT out
+ no ip redirects
+ no ip proxy-arp
+interface Vlan60
+ description SERVERS gateway
+ ip address 10.10.2.129 255.255.255.224
+ no ip redirects
+ no ip proxy-arp
+interface Vlan910
+ description FW-Transit to ASA inside (ASA active .2 / standby .3)
+ ip address 10.10.255.1 255.255.255.248
+ no ip redirects
+ no ip proxy-arp
+ip route 0.0.0.0 0.0.0.0 10.10.255.2
+!
+! ---- R&D isolation ACLs (Task 1/2 - L3 segmentation enforcement) ----
+ip access-list extended RD-IN
+ remark R&D -> anything (evaluated on traffic ENTERING the R&D SVI)
+ permit udp any eq bootpc any eq bootps
+ permit tcp 10.10.1.128 0.0.0.127 10.10.2.128 0.0.0.31 eq 22
+ permit tcp 10.10.1.128 0.0.0.127 10.10.2.128 0.0.0.31 eq 443
+ deny   ip 10.10.1.128 0.0.0.127 10.0.0.0 0.255.255.255 log
+ permit tcp 10.10.1.128 0.0.0.127 any eq 443
+ deny   ip any any log
+ip access-list extended RD-OUT
+ remark anything -> R&D (evaluated on traffic LEAVING the R&D SVI)
+ permit ip 10.10.2.160 0.0.0.31 10.10.1.128 0.0.0.127
+ permit tcp any 10.10.1.128 0.0.0.127 established
+ permit icmp any 10.10.1.128 0.0.0.127 echo-reply
+ deny   ip any 10.10.1.128 0.0.0.127 log
+!
+! ---- DHCP server for HQ user VLANs ----
+ip dhcp excluded-address 10.10.2.1 10.10.2.18
+ip dhcp excluded-address 10.10.2.65
+ip dhcp excluded-address 10.10.1.1 10.10.1.9
+ip dhcp excluded-address 10.10.1.129
+ip dhcp pool HQ-HR
+ network 10.10.2.0 255.255.255.192
+ default-router 10.10.2.1
+ip dhcp pool HQ-MKT
+ network 10.10.2.64 255.255.255.192
+ default-router 10.10.2.65
+ip dhcp pool HQ-SALES
+ network 10.10.1.0 255.255.255.128
+ default-router 10.10.1.1
+ip dhcp pool HQ-RND
+ network 10.10.1.128 255.255.255.128
+ default-router 10.10.1.129
+!
+! (DHCP snooping / DAI are enforced at the ACCESS layer - HQ-ACC-SW1 - where untrusted hosts attach.)
+!
+! ---- Ports ----
+interface GigabitEthernet0/0
+ description To-ASA-FW1-Gi0/1 (inside)
+ switchport mode access
+ switchport access vlan 910
+ switchport nonegotiate
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ no shutdown
+interface GigabitEthernet0/1
+ description To-ASA-FW2-Gi0/1 (inside)
+ switchport mode access
+ switchport access vlan 910
+ switchport nonegotiate
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ no shutdown
+interface GigabitEthernet0/2
+ description Trunk to HQ-ACC-SW1-Gi0/0
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 999
+ switchport trunk allowed vlan 10,20,30,50,99
+ switchport mode trunk
+ switchport nonegotiate
+ spanning-tree guard root
+ no shutdown
+interface GigabitEthernet0/3
+ description TACACS-SRV (servers VLAN)
+ switchport mode access
+ switchport access vlan 60
+ switchport nonegotiate
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ no shutdown
+interface GigabitEthernet1/0
+ description ADMIN-PC (MGMT VLAN, 10.10.2.170)
+ switchport mode access
+ switchport access vlan 99
+ switchport nonegotiate
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ no shutdown
+interface GigabitEthernet1/1
+ description Mgmt uplink to HQ-PSW-Gi1/3
+ switchport mode access
+ switchport access vlan 99
+ switchport nonegotiate
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ no shutdown
+interface GigabitEthernet1/2
+ description IDS-TAP-01 management NIC ens4 (servers VLAN, 10.10.2.140)
+ switchport mode access
+ switchport access vlan 60
+ switchport nonegotiate
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ no shutdown
+interface range GigabitEthernet1/3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+interface range GigabitEthernet2/0 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+interface range GigabitEthernet3/0 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+!
+! --- VTY management ACL (HQ MGMT + 3 branch MGMT VLANs + router loopbacks) ---
+ip access-list standard VTY-ACL
+ permit 10.10.2.160 0.0.0.31
+ permit 10.20.2.0 0.0.0.31
+ permit 10.30.2.0 0.0.0.31
+ permit 10.40.2.0 0.0.0.31
+ permit 10.255.0.0 0.0.3.255
+ deny   any log
+!
+! --- AAA: centralised TACACS+ with local fallback (Task 6) ---
+aaa new-model
+tacacs server TAC1
+ address ipv4 10.10.2.130
+ key GulfTechTacKey2026
+ timeout 3
+aaa group server tacacs+ TACACS-GRP
+ server name TAC1
+ip tacacs source-interface Vlan99
+aaa authentication login VTY-AUTH group TACACS-GRP local
+aaa authentication login CON-AUTH local
+aaa authorization exec VTY-AUTHZ group TACACS-GRP local
+aaa authorization exec CON-AUTHZ local
+aaa accounting exec ACC-EXEC start-stop group TACACS-GRP
+aaa accounting commands 1 ACC-CMD1 start-stop group TACACS-GRP
+aaa accounting commands 15 ACC-CMD15 start-stop group TACACS-GRP
+aaa session-id common
+!
+line con 0
+ login authentication CON-AUTH
+ authorization exec CON-AUTHZ
+ exec-timeout 5 0
+ logging synchronous
+line vty 0 4
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ accounting commands 1 ACC-CMD1
+ accounting commands 15 ACC-CMD15
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+ logging synchronous
+line vty 5 15
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+end
+write memory
+
+====================================================================================================
+>>> DEVICE: HQ-ACC-SW1    PLATFORM: IOSvL2
+>>> Console of HQ-ACC-SW1
+====================================================================================================
+! ---- STEP 0 (paste, then WAIT for the key-generation to finish) ----
+enable
+configure terminal
+hostname HQ-ACC-SW1
+ip domain-name gulftech.local
+crypto key generate rsa modulus 2048
+! ---- STEP 1 (paste the rest) ----
+hostname HQ-ACC-SW1
+no ip domain-lookup
+ip domain-name gulftech.local
+service password-encryption
+service timestamps debug datetime msec localtime
+service timestamps log datetime msec localtime
+no service pad
+no ip http server
+no ip http secure-server
+no cdp run
+login block-for 120 attempts 3 within 60
+login on-failure log
+login on-success log
+logging buffered 32768 informational
+logging console critical
+enable secret GulfTechEnable2026
+username netadmin privilege 15 secret GulfTechAdmin2026
+banner motd ^C
+*************************************************************
+  GULFTECH SOLUTIONS - AUTHORISED ACCESS ONLY
+  All activity is logged (AAA accounting). Disconnect now if
+  you are not an authorised administrator.
+*************************************************************
+^C
+vtp mode transparent
+ip ssh version 2
+ip ssh time-out 60
+ip ssh authentication-retries 3
+spanning-tree mode rapid-pvst
+spanning-tree extend system-id
+spanning-tree portfast bpduguard default
+spanning-tree loopguard default
+errdisable recovery cause bpduguard
+errdisable recovery cause psecure-violation
+errdisable recovery cause storm-control
+errdisable recovery interval 300
+ip dhcp snooping
+no ip dhcp snooping information option
+ip arp inspection validate src-mac dst-mac ip
+ip default-gateway 10.10.2.161
+!
+interface Vlan99
+ description MANAGEMENT SVI
+ ip address 10.10.2.163 255.255.255.224
+ no shutdown
+vlan 10
+ name HR
+vlan 20
+ name MARKETING
+vlan 30
+ name SALES
+vlan 50
+ name RND-ISOLATED
+vlan 99
+ name MANAGEMENT
+vlan 998
+ name PARKING-BLACKHOLE
+vlan 999
+ name NATIVE-UNUSED
+ip dhcp snooping vlan 10,20,30,50
+ip arp inspection vlan 10,20,30,50
+!
+interface GigabitEthernet0/0
+ description Trunk to HQ-CORE-SW1-Gi0/2
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 999
+ switchport trunk allowed vlan 10,20,30,50,99
+ switchport mode trunk
+ switchport nonegotiate
+ ip dhcp snooping trust
+ ip arp inspection trust
+ no shutdown
+interface GigabitEthernet0/1
+ description HR-PC
+ switchport mode access
+ switchport access vlan 10
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ ip dhcp snooping limit rate 15
+ ip verify source
+ no shutdown
+interface GigabitEthernet0/2
+ description MKT-PC
+ switchport mode access
+ switchport access vlan 20
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ ip dhcp snooping limit rate 15
+ ip verify source
+ no shutdown
+interface GigabitEthernet0/3
+ description SALES-PC
+ switchport mode access
+ switchport access vlan 30
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ ip dhcp snooping limit rate 15
+ ip verify source
+ no shutdown
+interface GigabitEthernet1/0
+ description RND-PC
+ switchport mode access
+ switchport access vlan 50
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ ip dhcp snooping limit rate 15
+ ip verify source
+ no shutdown
+interface GigabitEthernet1/1
+ description ROGUE-DEV (Kali: DHCP-rogue / ARP-spoof / MAC / storm tests) - VLAN30
+ switchport mode access
+ switchport access vlan 30
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ ip dhcp snooping limit rate 15
+ ip verify source
+ no shutdown
+interface range GigabitEthernet1/2 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+interface range GigabitEthernet2/0 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+interface range GigabitEthernet3/0 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+!
+! --- VTY management ACL (HQ MGMT + 3 branch MGMT VLANs + router loopbacks) ---
+ip access-list standard VTY-ACL
+ permit 10.10.2.160 0.0.0.31
+ permit 10.20.2.0 0.0.0.31
+ permit 10.30.2.0 0.0.0.31
+ permit 10.40.2.0 0.0.0.31
+ permit 10.255.0.0 0.0.3.255
+ deny   any log
+!
+! --- AAA: centralised TACACS+ with local fallback (Task 6) ---
+aaa new-model
+tacacs server TAC1
+ address ipv4 10.10.2.130
+ key GulfTechTacKey2026
+ timeout 3
+aaa group server tacacs+ TACACS-GRP
+ server name TAC1
+ip tacacs source-interface Vlan99
+aaa authentication login VTY-AUTH group TACACS-GRP local
+aaa authentication login CON-AUTH local
+aaa authorization exec VTY-AUTHZ group TACACS-GRP local
+aaa authorization exec CON-AUTHZ local
+aaa accounting exec ACC-EXEC start-stop group TACACS-GRP
+aaa accounting commands 1 ACC-CMD1 start-stop group TACACS-GRP
+aaa accounting commands 15 ACC-CMD15 start-stop group TACACS-GRP
+aaa session-id common
+!
+line con 0
+ login authentication CON-AUTH
+ authorization exec CON-AUTHZ
+ exec-timeout 5 0
+ logging synchronous
+line vty 0 4
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ accounting commands 1 ACC-CMD1
+ accounting commands 15 ACC-CMD15
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+ logging synchronous
+line vty 5 15
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+end
+write memory
+
+====================================================================================================
+>>> DEVICE: HQ-PSW    PLATFORM: IOSvL2
+>>> Console of HQ-PSW
+====================================================================================================
+! ---- STEP 0 (paste, then WAIT for the key-generation to finish) ----
+enable
+configure terminal
+hostname HQ-PSW
+ip domain-name gulftech.local
+crypto key generate rsa modulus 2048
+! ---- STEP 1 (paste the rest) ----
+hostname HQ-PSW
+no ip domain-lookup
+ip domain-name gulftech.local
+service password-encryption
+service timestamps debug datetime msec localtime
+service timestamps log datetime msec localtime
+no service pad
+no ip http server
+no ip http secure-server
+no cdp run
+login block-for 120 attempts 3 within 60
+login on-failure log
+login on-success log
+logging buffered 32768 informational
+logging console critical
+enable secret GulfTechEnable2026
+username netadmin privilege 15 secret GulfTechAdmin2026
+banner motd ^C
+*************************************************************
+  GULFTECH SOLUTIONS - AUTHORISED ACCESS ONLY
+  All activity is logged (AAA accounting). Disconnect now if
+  you are not an authorised administrator.
+*************************************************************
+^C
+vtp mode transparent
+ip ssh version 2
+ip ssh time-out 60
+ip ssh authentication-retries 3
+spanning-tree mode rapid-pvst
+spanning-tree extend system-id
+spanning-tree portfast bpduguard default
+spanning-tree loopguard default
+errdisable recovery cause bpduguard
+errdisable recovery cause psecure-violation
+errdisable recovery cause storm-control
+errdisable recovery interval 300
+ip dhcp snooping
+no ip dhcp snooping information option
+ip arp inspection validate src-mac dst-mac ip
+ip default-gateway 10.10.2.161
+!
+interface Vlan99
+ description MANAGEMENT SVI
+ ip address 10.10.2.162 255.255.255.224
+ no shutdown
+! (no DHCP clients on this switch -> snooping/DAI not enabled per-VLAN; port-security + storm-control + SPAN used instead)
+no ip dhcp snooping
+vlan 99
+ name MANAGEMENT
+vlan 100
+ name DMZ
+vlan 900
+ name OUTSIDE-PERIMETER
+vlan 998
+ name PARKING-BLACKHOLE
+vlan 999
+ name NATIVE-UNUSED
+!
+interface GigabitEthernet0/0
+ description To-HQ-R1-Gi0/0 (outside)
+ switchport mode access
+ switchport access vlan 900
+ switchport nonegotiate
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ storm-control broadcast level 10.00
+ storm-control action shutdown
+ no cdp enable
+ no shutdown
+interface GigabitEthernet0/1
+ description To-ASA-FW1-Gi0/0 (outside)
+ switchport mode access
+ switchport access vlan 900
+ switchport nonegotiate
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ storm-control broadcast level 10.00
+ storm-control action shutdown
+ no cdp enable
+ no shutdown
+interface GigabitEthernet0/2
+ description To-ASA-FW2-Gi0/0 (outside)
+ switchport mode access
+ switchport access vlan 900
+ switchport nonegotiate
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ storm-control broadcast level 10.00
+ storm-control action shutdown
+ no cdp enable
+ no shutdown
+interface GigabitEthernet0/3
+ description To-ASA-FW1-Gi0/2 (dmz)
+ switchport mode access
+ switchport access vlan 100
+ switchport nonegotiate
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ storm-control broadcast level 10.00
+ storm-control action shutdown
+ no cdp enable
+ no shutdown
+interface GigabitEthernet1/0
+ description To-ASA-FW2-Gi0/2 (dmz)
+ switchport mode access
+ switchport access vlan 100
+ switchport nonegotiate
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ storm-control broadcast level 10.00
+ storm-control action shutdown
+ no cdp enable
+ no shutdown
+interface GigabitEthernet1/1
+ description DMZ-SRV (web .10 + mail .11)
+ switchport mode access
+ switchport access vlan 100
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ no shutdown
+interface GigabitEthernet1/2
+ description SPAN DESTINATION -> IDS-TAP-01 ens3 (monitor only, no IP)
+ switchport mode access
+ switchport access vlan 998
+ no cdp enable
+ no shutdown
+interface GigabitEthernet1/3
+ description Mgmt uplink to HQ-CORE-SW1-Gi1/1
+ switchport mode access
+ switchport access vlan 99
+ switchport nonegotiate
+ spanning-tree portfast
+ no cdp enable
+ no shutdown
+! ---- SPAN: IDS sees traffic BEFORE the firewall (VLAN900) and inside the DMZ (VLAN100) ----
+monitor session 1 source vlan 900 both
+monitor session 1 source vlan 100 both
+monitor session 1 destination interface GigabitEthernet1/2
+interface range GigabitEthernet2/0 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+interface range GigabitEthernet3/0 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+!
+! --- VTY management ACL (HQ MGMT + 3 branch MGMT VLANs + router loopbacks) ---
+ip access-list standard VTY-ACL
+ permit 10.10.2.160 0.0.0.31
+ permit 10.20.2.0 0.0.0.31
+ permit 10.30.2.0 0.0.0.31
+ permit 10.40.2.0 0.0.0.31
+ permit 10.255.0.0 0.0.3.255
+ deny   any log
+!
+! --- AAA: centralised TACACS+ with local fallback (Task 6) ---
+aaa new-model
+tacacs server TAC1
+ address ipv4 10.10.2.130
+ key GulfTechTacKey2026
+ timeout 3
+aaa group server tacacs+ TACACS-GRP
+ server name TAC1
+ip tacacs source-interface Vlan99
+aaa authentication login VTY-AUTH group TACACS-GRP local
+aaa authentication login CON-AUTH local
+aaa authorization exec VTY-AUTHZ group TACACS-GRP local
+aaa authorization exec CON-AUTHZ local
+aaa accounting exec ACC-EXEC start-stop group TACACS-GRP
+aaa accounting commands 1 ACC-CMD1 start-stop group TACACS-GRP
+aaa accounting commands 15 ACC-CMD15 start-stop group TACACS-GRP
+aaa session-id common
+!
+line con 0
+ login authentication CON-AUTH
+ authorization exec CON-AUTHZ
+ exec-timeout 5 0
+ logging synchronous
+line vty 0 4
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ accounting commands 1 ACC-CMD1
+ accounting commands 15 ACC-CMD15
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+ logging synchronous
+line vty 5 15
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+end
+write memory
+
+
+####################################################################################################
+# SECTION 4 - FIREWALL HIGH-AVAILABILITY PAIR (Task 5)
+####################################################################################################
+
+====================================================================================================
+>>> DEVICE: ASA-FW1 (PRIMARY / ACTIVE)    PLATFORM: ASAv
+>>> Console of ASA-FW1
+====================================================================================================
+! IPs: outside active .1 / standby .2 (HQ-R1 = 192.0.2.3) | inside active .2 / standby .3 (HQ-CORE-SW1 = 10.10.255.1) | dmz active .1 / standby .2
+! (ASAv: e0=Management0/0, e1=Gi0/0, e2=Gi0/1, e3=Gi0/2, e4=Gi0/3 -> see wiring table)
+enable
+configure terminal
+hostname GT-ASA
+domain-name gulftech.local
+enable password GulfTechEnable2026
+username netadmin password GulfTechAdmin2026 privilege 15
+!
+! ================= INTERFACES / ZONES (Task 5) =================
+interface GigabitEthernet0/0
+ description OUTSIDE (external zone) to HQ-PSW VLAN900
+ nameif outside
+ security-level 0
+ ip address 192.0.2.1 255.255.255.240 standby 192.0.2.2
+ no shutdown
+interface GigabitEthernet0/1
+ description INSIDE (internal zone) to HQ-CORE-SW1 VLAN910
+ nameif inside
+ security-level 100
+ ip address 10.10.255.2 255.255.255.248 standby 10.10.255.3
+ no shutdown
+interface GigabitEthernet0/2
+ description DMZ zone to HQ-PSW VLAN100
+ nameif dmz
+ security-level 50
+ ip address 10.10.3.1 255.255.255.224 standby 10.10.3.2
+ no shutdown
+interface GigabitEthernet0/3
+ description FAILOVER LAN + STATEFUL link (direct cable FW1<->FW2)
+ no shutdown
+!
+! ================= OBJECTS =================
+object network HQ-HR
+ subnet 10.10.2.0 255.255.255.192
+object network HQ-MKT
+ subnet 10.10.2.64 255.255.255.192
+object network HQ-SALES
+ subnet 10.10.1.0 255.255.255.128
+object network HQ-RND
+ subnet 10.10.1.128 255.255.255.128
+object network HQ-SRV
+ subnet 10.10.2.128 255.255.255.224
+object network HQ-MGMT
+ subnet 10.10.2.160 255.255.255.224
+object network DMZ-NET
+ subnet 10.10.3.0 255.255.255.224
+object network DMZ-WEB
+ host 10.10.3.10
+object network DMZ-MAIL
+ host 10.10.3.11
+object network TACACS-SRV
+ host 10.10.2.130
+object network RND-PORTAL
+ host 203.0.113.19
+object network BR-DXB
+ subnet 10.20.0.0 255.255.0.0
+object network BR-RUH
+ subnet 10.30.0.0 255.255.0.0
+object network BR-DOH
+ subnet 10.40.0.0 255.255.0.0
+object network VPN-INFRA
+ subnet 10.255.0.0 255.255.252.0
+!
+object-group network OG-HQ-USERS
+ network-object object HQ-HR
+ network-object object HQ-MKT
+ network-object object HQ-SALES
+object-group network OG-HQ-INTERNAL
+ network-object 10.10.1.0 255.255.255.0
+ network-object 10.10.2.0 255.255.255.0
+object-group network OG-BRANCH-ALL
+ network-object object BR-DXB
+ network-object object BR-RUH
+ network-object object BR-DOH
+ network-object object VPN-INFRA
+object-group network OG-BRANCH-USERS
+ network-object 10.20.1.0 255.255.255.0
+ network-object 10.30.1.0 255.255.255.0
+ network-object 10.40.1.0 255.255.255.0
+object-group network OG-BRANCH-MGMT
+ network-object 10.20.2.0 255.255.255.224
+ network-object 10.30.2.0 255.255.255.224
+ network-object 10.40.2.0 255.255.255.224
+object-group service OG-WEB tcp
+ port-object eq www
+ port-object eq https
+object-group service OG-DMZ-SVC tcp
+ port-object eq www
+ port-object eq https
+ port-object eq smtp
+!
+! ================= NAT =================
+! 1) NAT exemption: HQ <-> branches travel un-translated through the VPN
+nat (inside,outside) source static OG-HQ-INTERNAL OG-HQ-INTERNAL destination static OG-BRANCH-ALL OG-BRANCH-ALL
+! 2) Static NAT: published DMZ services
+object network DMZ-WEB
+ nat (dmz,outside) static 192.0.2.10
+object network DMZ-MAIL
+ nat (dmz,outside) static 192.0.2.11
+! 3) Dynamic PAT for Internet access
+object network PAT-INSIDE-1
+ subnet 10.10.1.0 255.255.255.0
+ nat (inside,outside) dynamic interface
+object network PAT-INSIDE-2
+ subnet 10.10.2.0 255.255.255.0
+ nat (inside,outside) dynamic interface
+object network DMZ-NET
+ nat (dmz,outside) dynamic interface
+!
+! ================= ACCESS CONTROL (zone policy) =================
+! ---- INSIDE -> (outside, dmz) ----
+access-list INSIDE_IN extended permit tcp object HQ-RND object RND-PORTAL eq https
+access-list INSIDE_IN extended deny ip object HQ-RND any log
+access-list INSIDE_IN extended permit ip object-group OG-HQ-USERS object-group OG-BRANCH-ALL
+access-list INSIDE_IN extended permit ip object HQ-MGMT object-group OG-BRANCH-ALL
+access-list INSIDE_IN extended permit tcp object-group OG-HQ-USERS any object-group OG-WEB
+access-list INSIDE_IN extended permit tcp object HQ-SRV any object-group OG-WEB
+access-list INSIDE_IN extended permit tcp object-group OG-HQ-USERS object DMZ-NET object-group OG-DMZ-SVC
+access-list INSIDE_IN extended permit tcp object HQ-MGMT object DMZ-NET eq ssh
+access-list INSIDE_IN extended permit icmp any any
+access-list INSIDE_IN extended deny ip any any log
+access-group INSIDE_IN in interface inside
+! ---- OUTSIDE -> (inside, dmz)  [real (un-NATed) addresses are used in ACLs on ASA 9.x] ----
+access-list OUTSIDE_IN extended deny ip any object HQ-RND log
+access-list OUTSIDE_IN extended permit tcp any object DMZ-WEB object-group OG-WEB
+access-list OUTSIDE_IN extended permit tcp any object DMZ-MAIL eq smtp
+access-list OUTSIDE_IN extended permit tcp object-group OG-BRANCH-ALL object TACACS-SRV eq tacacs
+access-list OUTSIDE_IN extended permit tcp object-group OG-BRANCH-MGMT object HQ-MGMT eq ssh
+access-list OUTSIDE_IN extended permit tcp object-group OG-BRANCH-USERS object HQ-SRV object-group OG-WEB
+access-list OUTSIDE_IN extended permit icmp object-group OG-BRANCH-ALL object HQ-MGMT
+access-list OUTSIDE_IN extended permit icmp object-group OG-BRANCH-ALL object HQ-SRV
+access-list OUTSIDE_IN extended deny ip any any log
+access-group OUTSIDE_IN in interface outside
+! ---- DMZ -> (inside, outside): a compromised DMZ host must not reach internal networks ----
+access-list DMZ_IN extended deny ip object DMZ-NET object-group OG-HQ-INTERNAL log
+access-list DMZ_IN extended deny ip object DMZ-NET object-group OG-BRANCH-ALL log
+access-list DMZ_IN extended permit tcp object DMZ-NET any object-group OG-WEB
+access-list DMZ_IN extended permit tcp object DMZ-MAIL any eq smtp
+! NOTE: no DNS service exists in the lab (all hosts are addressed by IP), therefore no udp/53 rule is configured.
+! In production add: permit udp <DMZ/servers> <corporate resolvers> eq domain.
+access-list DMZ_IN extended deny ip any any log
+access-group DMZ_IN in interface dmz
+!
+! ================= ROUTING =================
+route outside 0.0.0.0 0.0.0.0 192.0.2.3 1
+route outside 10.20.0.0 255.255.0.0 192.0.2.3 1
+route outside 10.30.0.0 255.255.0.0 192.0.2.3 1
+route outside 10.40.0.0 255.255.0.0 192.0.2.3 1
+route outside 10.255.0.0 255.255.252.0 192.0.2.3 1
+route inside 10.10.1.0 255.255.255.0 10.10.255.1 1
+route inside 10.10.2.0 255.255.255.0 10.10.255.1 1
+!
+! ================= DDoS / INSPECTION (Task 2 + Task 5) =================
+class-map CM-OUTSIDE-PROTECT
+ match any
+policy-map PM-OUTSIDE-PROTECT
+ class CM-OUTSIDE-PROTECT
+  set connection conn-max 2000 embryonic-conn-max 500 per-client-embryonic-max 50 per-client-max 200
+service-policy PM-OUTSIDE-PROTECT interface outside
+policy-map global_policy
+ class inspection_default
+  inspect http
+  inspect icmp
+  inspect esmtp
+threat-detection basic-threat
+threat-detection scanning-threat
+threat-detection statistics access-list
+!
+! ================= ADMIN ACCESS + AAA (Task 6) =================
+aaa-server TACACS-GRP protocol tacacs+
+aaa-server TACACS-GRP (inside) host 10.10.2.130
+ key GulfTechTacKey2026
+ timeout 5
+aaa authentication ssh console TACACS-GRP LOCAL
+aaa accounting ssh console TACACS-GRP
+crypto key generate rsa modulus 2048
+ssh version 2
+ssh 10.10.2.160 255.255.255.224 inside
+ssh timeout 5
+!
+logging enable
+logging timestamp
+logging buffer-size 65536
+logging buffered informational
+!
+! ================= ACTIVE/STANDBY HIGH AVAILABILITY (Task 5) =================
+failover lan unit primary
+failover lan interface FOLINK GigabitEthernet0/3
+failover link FOLINK GigabitEthernet0/3
+failover interface ip FOLINK 10.255.254.1 255.255.255.252 standby 10.255.254.2
+failover polltime unit 1 holdtime 3
+failover polltime interface 1 holdtime 5
+failover key GulfTechFoKey2026
+failover
+end
+write memory
+
+====================================================================================================
+>>> DEVICE: ASA-FW2 (SECONDARY / STANDBY)    PLATFORM: ASAv
+>>> Console of ASA-FW2
+====================================================================================================
+! Paste ONLY after FW1 is configured. FW2 then receives the full configuration from FW1 automatically.
+enable
+configure terminal
+interface GigabitEthernet0/3
+ no shutdown
+failover lan unit secondary
+failover lan interface FOLINK GigabitEthernet0/3
+failover link FOLINK GigabitEthernet0/3
+failover interface ip FOLINK 10.255.254.1 255.255.255.252 standby 10.255.254.2
+failover key GulfTechFoKey2026
+failover
+end
+! Wait ~30 s, then verify on BOTH units:  show failover      (FW1 = Active, FW2 = Standby Ready)
+! After the configuration has synchronised and FW2 shows 'Standby Ready', SAVE ON FW2 TOO:
+write memory
+
+
+####################################################################################################
+# SECTION 5 - HQ EDGE ROUTER + BRANCHES + VPN (Tasks 2, 3, 6)  [5a = crypto pre-flight first]
+####################################################################################################
+
+! ==== SECTION 5a - CRYPTO PRE-FLIGHT (run on HQ-R1, DXB-R1, RUH-R1 and DOH-R1 BEFORE pasting their blocks) ====
+! Ask each router what it supports (type the '?' interactively - do not paste it):
+!    configure terminal
+!    crypto ikev2 proposal TEST
+!     integrity ?            <- must list sha384
+!     group ?                <- must list 20
+!    exit
+!    crypto ipsec transform-set TEST esp-aes 256 ?     <- must list esp-sha384-hmac
+!    no crypto ikev2 proposal TEST
+!    no crypto ipsec transform-set TEST
+! If ALL FOUR routers accept them -> paste the blocks unchanged.
+! If ANY router rejects them -> use the SAME fallback on ALL FOUR routers (a mismatch breaks the tunnels):
+!
+!    In the pasted router block, search/replace      WITH
+!      integrity sha384                             integrity sha256
+!      group 20                                     group 14
+!      esp-sha384-hmac                              esp-sha256-hmac
+!      set pfs group20                              set pfs group14
+!
+! Record which variant you used in the report (Task 3).
+
+====================================================================================================
+>>> DEVICE: HQ-R1    PLATFORM: IOSv
+>>> Console of HQ-R1
+====================================================================================================
+! ---- STEP 0 (paste, then WAIT for the key-generation to finish) ----
+enable
+configure terminal
+hostname HQ-R1
+ip domain-name gulftech.local
+crypto key generate rsa modulus 2048
+! ---- STEP 1 (paste the rest) ----
+hostname HQ-R1
+no ip domain-lookup
+ip domain-name gulftech.local
+service password-encryption
+service timestamps debug datetime msec localtime
+service timestamps log datetime msec localtime
+service tcp-keepalives-in
+service tcp-keepalives-out
+no service pad
+no ip source-route
+no ip http server
+no ip http secure-server
+no ip bootp server
+no cdp run
+security passwords min-length 10
+login block-for 120 attempts 3 within 60
+login on-failure log
+login on-success log
+logging buffered 32768 informational
+logging console critical
+enable secret GulfTechEnable2026
+username netadmin privilege 15 secret GulfTechAdmin2026
+banner motd ^C
+*************************************************************
+  GULFTECH SOLUTIONS - AUTHORISED ACCESS ONLY
+  All activity is logged (AAA accounting). Disconnect now if
+  you are not an authorised administrator.
+*************************************************************
+^C
+ip ssh version 2
+ip ssh time-out 60
+ip ssh authentication-retries 3
+!
+! --- VTY management ACL (HQ MGMT + 3 branch MGMT VLANs + router loopbacks) ---
+ip access-list standard VTY-ACL
+ permit 10.10.2.160 0.0.0.31
+ permit 10.20.2.0 0.0.0.31
+ permit 10.30.2.0 0.0.0.31
+ permit 10.40.2.0 0.0.0.31
+ permit 10.255.0.0 0.0.3.255
+ deny   any log
+!
+! --- AAA: centralised TACACS+ with local fallback (Task 6) ---
+aaa new-model
+tacacs server TAC1
+ address ipv4 10.10.2.130
+ key GulfTechTacKey2026
+ timeout 3
+aaa group server tacacs+ TACACS-GRP
+ server name TAC1
+ip tacacs source-interface Loopback0
+aaa authentication login VTY-AUTH group TACACS-GRP local
+aaa authentication login CON-AUTH local
+aaa authorization exec VTY-AUTHZ group TACACS-GRP local
+aaa authorization exec CON-AUTHZ local
+aaa accounting exec ACC-EXEC start-stop group TACACS-GRP
+aaa accounting commands 1 ACC-CMD1 start-stop group TACACS-GRP
+aaa accounting commands 15 ACC-CMD15 start-stop group TACACS-GRP
+aaa session-id common
+!
+line con 0
+ login authentication CON-AUTH
+ authorization exec CON-AUTHZ
+ exec-timeout 5 0
+ logging synchronous
+line vty 0 4
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ accounting commands 1 ACC-CMD1
+ accounting commands 15 ACC-CMD15
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+ logging synchronous
+!
+! ================= INTERFACES =================
+interface Loopback0
+ description Router-ID / management / TACACS source
+ ip address 10.255.0.1 255.255.255.255
+interface GigabitEthernet0/0
+ description To-HQ-PSW-Gi0/0 (VLAN900 outside/perimeter segment 192.0.2.0/28, ASA active=.1 standby=.2)
+ ip address 192.0.2.3 255.255.255.240
+ no ip redirects
+ no ip unreachables
+ no ip proxy-arp
+ no shutdown
+interface GigabitEthernet0/1
+ description ISP1 PRIMARY
+ ip address 198.51.100.2 255.255.255.252
+ ip access-group WAN-IN-1 in
+ ip verify unicast source reachable-via rx allow-default
+ no ip redirects
+ no ip unreachables
+ no ip proxy-arp
+ no shutdown
+interface GigabitEthernet0/2
+ description ISP2 BACKUP
+ ip address 192.0.2.18 255.255.255.252
+ ip access-group WAN-IN-2 in
+ ip verify unicast source reachable-via rx allow-default
+ no ip redirects
+ no ip unreachables
+ no ip proxy-arp
+ no shutdown
+!
+! ================= INBOUND WAN ACLs (Task 2 - L3 control) =================
+ip access-list extended WAN-IN-1
+ remark --- anti-spoofing: bogons and our own public space may never arrive from the Internet
+ deny   ip 0.0.0.0 0.255.255.255 any
+ deny   ip 10.0.0.0 0.255.255.255 any
+ deny   ip 127.0.0.0 0.255.255.255 any
+ deny   ip 169.254.0.0 0.0.255.255 any
+ deny   ip 172.16.0.0 0.15.255.255 any
+ deny   ip 192.168.0.0 0.0.255.255 any
+ deny   ip 224.0.0.0 15.255.255.255 any
+ deny   ip 192.0.2.0 0.0.0.15 any
+ remark --- IPsec (IKEv2 + ESP + NAT-T) only from known VPN peers
+ permit esp host 198.51.100.6 host 198.51.100.2
+ permit udp host 198.51.100.6 host 198.51.100.2 eq isakmp
+ permit udp host 198.51.100.6 host 198.51.100.2 eq non500-isakmp
+ permit esp host 198.51.100.10 host 198.51.100.2
+ permit udp host 198.51.100.10 host 198.51.100.2 eq isakmp
+ permit udp host 198.51.100.10 host 198.51.100.2 eq non500-isakmp
+ permit esp host 198.51.100.14 host 198.51.100.2
+ permit udp host 198.51.100.14 host 198.51.100.2 eq isakmp
+ permit udp host 198.51.100.14 host 198.51.100.2 eq non500-isakmp
+ remark --- diagnostics
+ permit icmp any host 198.51.100.2 echo
+ permit icmp any any echo-reply
+ permit icmp any any unreachable
+ permit icmp any any time-exceeded
+ remark --- coarse permit to the ASA-protected public prefix (fine filtering is done by the ASA)
+ permit ip any 192.0.2.0 0.0.0.15
+ deny   ip any any log
+!
+ip access-list extended WAN-IN-2
+ remark --- anti-spoofing: bogons and our own public space may never arrive from the Internet
+ deny   ip 0.0.0.0 0.255.255.255 any
+ deny   ip 10.0.0.0 0.255.255.255 any
+ deny   ip 127.0.0.0 0.255.255.255 any
+ deny   ip 169.254.0.0 0.0.255.255 any
+ deny   ip 172.16.0.0 0.15.255.255 any
+ deny   ip 192.168.0.0 0.0.255.255 any
+ deny   ip 224.0.0.0 15.255.255.255 any
+ deny   ip 192.0.2.0 0.0.0.15 any
+ remark --- IPsec (IKEv2 + ESP + NAT-T) only from known VPN peers
+ permit esp host 192.0.2.22 host 192.0.2.18
+ permit udp host 192.0.2.22 host 192.0.2.18 eq isakmp
+ permit udp host 192.0.2.22 host 192.0.2.18 eq non500-isakmp
+ permit esp host 192.0.2.26 host 192.0.2.18
+ permit udp host 192.0.2.26 host 192.0.2.18 eq isakmp
+ permit udp host 192.0.2.26 host 192.0.2.18 eq non500-isakmp
+ permit esp host 192.0.2.30 host 192.0.2.18
+ permit udp host 192.0.2.30 host 192.0.2.18 eq isakmp
+ permit udp host 192.0.2.30 host 192.0.2.18 eq non500-isakmp
+ remark --- diagnostics
+ permit icmp any host 192.0.2.18 echo
+ permit icmp any any echo-reply
+ permit icmp any any unreachable
+ permit icmp any any time-exceeded
+ remark --- coarse permit to the ASA-protected public prefix
+ permit ip any 192.0.2.0 0.0.0.15
+ deny   ip any any log
+!
+! ================= CONTROL-PLANE POLICING (DDoS resilience; skip if image rejects it) =================
+ip access-list extended COPP-ICMP
+ permit icmp any any echo
+ permit icmp any any echo-reply
+class-map match-all CM-COPP-ICMP
+ match access-group name COPP-ICMP
+policy-map PM-COPP
+ class CM-COPP-ICMP
+  police 64000 conform-action transmit exceed-action drop
+control-plane
+ service-policy input PM-COPP
+!
+! ================= ROUTING =================
+! Underlay: ISP1 link block 198.51.100.0/24 and ISP2 link block 192.0.2.16/28 (both RFC 5737), each via its own gateway,
+! so every tunnel stays on its own ISP.  The Internet LAN 203.0.113.0/24 follows the tracked default.
+ip route 198.51.100.0 255.255.255.0 198.51.100.1
+ip route 192.0.2.16 255.255.255.240 192.0.2.17
+ip sla 1
+ icmp-echo 198.51.100.1 source-interface GigabitEthernet0/1
+ frequency 5
+ip sla schedule 1 life forever start-time now
+track 1 ip sla 1 reachability
+ip route 0.0.0.0 0.0.0.0 198.51.100.1 track 1
+ip route 0.0.0.0 0.0.0.0 192.0.2.17 250
+ip route 203.0.113.0 255.255.255.0 198.51.100.1 track 1
+ip route 203.0.113.0 255.255.255.0 192.0.2.17 250
+! HQ internal supernet lives behind the ACTIVE ASA outside address (192.0.2.1 floats between FW1/FW2)
+ip route 10.10.0.0 255.255.0.0 192.0.2.1
+ip prefix-list PL-HQ seq 5 permit 10.10.0.0/16
+route-map RM-HQ-TO-EIGRP permit 10
+ match ip address prefix-list PL-HQ
+!
+! ================= IKEv2 / IPsec (Task 3) =================
+crypto ikev2 proposal PROP-AES256
+ encryption aes-cbc-256
+ integrity sha384
+ group 20
+! (if the image rejects group 20 / sha384, fall back to: integrity sha256 / group 14)
+crypto ikev2 policy POL-GT
+ proposal PROP-AES256
+crypto ikev2 dpd 10 3 periodic
+crypto ikev2 keyring KR-HUB
+ peer DXB-ISP1
+  address 198.51.100.6
+  pre-shared-key local H2DXB1Qm7Zp4Lv9Bt2026
+  pre-shared-key remote S2DXB1Rk3Wd8Nc5Yh2026
+ peer DXB-ISP2
+  address 192.0.2.22
+  pre-shared-key local H2DXB2Qm7Zp4Lv9Bt2026
+  pre-shared-key remote S2DXB2Rk3Wd8Nc5Yh2026
+ peer RUH-ISP1
+  address 198.51.100.10
+  pre-shared-key local H2RUH1Qm7Zp4Lv9Bt2026
+  pre-shared-key remote S2RUH1Rk3Wd8Nc5Yh2026
+ peer RUH-ISP2
+  address 192.0.2.26
+  pre-shared-key local H2RUH2Qm7Zp4Lv9Bt2026
+  pre-shared-key remote S2RUH2Rk3Wd8Nc5Yh2026
+ peer DOH-ISP1
+  address 198.51.100.14
+  pre-shared-key local H2DOH1Qm7Zp4Lv9Bt2026
+  pre-shared-key remote S2DOH1Rk3Wd8Nc5Yh2026
+ peer DOH-ISP2
+  address 192.0.2.30
+  pre-shared-key local H2DOH2Qm7Zp4Lv9Bt2026
+  pre-shared-key remote S2DOH2Rk3Wd8Nc5Yh2026
+crypto ikev2 profile IKEV2-PROF
+ match identity remote address 198.51.100.6 255.255.255.255
+ match identity remote address 192.0.2.22 255.255.255.255
+ match identity remote address 198.51.100.10 255.255.255.255
+ match identity remote address 192.0.2.26 255.255.255.255
+ match identity remote address 198.51.100.14 255.255.255.255
+ match identity remote address 192.0.2.30 255.255.255.255
+ authentication local pre-share
+ authentication remote pre-share
+ keyring local KR-HUB
+ lifetime 28800
+crypto ipsec transform-set TS-AES256 esp-aes 256 esp-sha384-hmac
+ mode tunnel
+crypto ipsec profile IPSEC-PROF
+ set transform-set TS-AES256
+ set ikev2-profile IKEV2-PROF
+ set pfs group20
+ set security-association lifetime seconds 3600
+!
+interface Tunnel11
+ description VPN to DXB via ISP1 (PRIMARY)
+ ip address 10.255.1.1 255.255.255.252
+ ip mtu 1400
+ ip tcp adjust-mss 1360
+ bandwidth 10000
+ delay 1000
+ ip hello-interval eigrp 100 3
+ ip hold-time eigrp 100 9
+ tunnel source GigabitEthernet0/1
+ tunnel destination 198.51.100.6
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-PROF
+ no shutdown
+interface Tunnel21
+ description VPN to DXB via ISP2 (BACKUP)
+ ip address 10.255.2.1 255.255.255.252
+ ip mtu 1400
+ ip tcp adjust-mss 1360
+ bandwidth 10000
+ delay 5000
+ ip hello-interval eigrp 100 3
+ ip hold-time eigrp 100 9
+ tunnel source GigabitEthernet0/2
+ tunnel destination 192.0.2.22
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-PROF
+ no shutdown
+interface Tunnel12
+ description VPN to RUH via ISP1 (PRIMARY)
+ ip address 10.255.1.5 255.255.255.252
+ ip mtu 1400
+ ip tcp adjust-mss 1360
+ bandwidth 10000
+ delay 1000
+ ip hello-interval eigrp 100 3
+ ip hold-time eigrp 100 9
+ tunnel source GigabitEthernet0/1
+ tunnel destination 198.51.100.10
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-PROF
+ no shutdown
+interface Tunnel22
+ description VPN to RUH via ISP2 (BACKUP)
+ ip address 10.255.2.5 255.255.255.252
+ ip mtu 1400
+ ip tcp adjust-mss 1360
+ bandwidth 10000
+ delay 5000
+ ip hello-interval eigrp 100 3
+ ip hold-time eigrp 100 9
+ tunnel source GigabitEthernet0/2
+ tunnel destination 192.0.2.26
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-PROF
+ no shutdown
+interface Tunnel13
+ description VPN to DOH via ISP1 (PRIMARY)
+ ip address 10.255.1.9 255.255.255.252
+ ip mtu 1400
+ ip tcp adjust-mss 1360
+ bandwidth 10000
+ delay 1000
+ ip hello-interval eigrp 100 3
+ ip hold-time eigrp 100 9
+ tunnel source GigabitEthernet0/1
+ tunnel destination 198.51.100.14
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-PROF
+ no shutdown
+interface Tunnel23
+ description VPN to DOH via ISP2 (BACKUP)
+ ip address 10.255.2.9 255.255.255.252
+ ip mtu 1400
+ ip tcp adjust-mss 1360
+ bandwidth 10000
+ delay 5000
+ ip hello-interval eigrp 100 3
+ ip hold-time eigrp 100 9
+ tunnel source GigabitEthernet0/2
+ tunnel destination 192.0.2.30
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-PROF
+ no shutdown
+!
+router eigrp 100
+ eigrp router-id 10.255.0.1
+ network 10.255.0.1 0.0.0.0
+ network 10.255.1.0 0.0.0.255
+ network 10.255.2.0 0.0.0.255
+ redistribute static metric 10000 100 255 1 1400 route-map RM-HQ-TO-EIGRP
+ passive-interface default
+ no passive-interface Tunnel11
+ no passive-interface Tunnel21
+ no passive-interface Tunnel12
+ no passive-interface Tunnel22
+ no passive-interface Tunnel13
+ no passive-interface Tunnel23
+!
+end
+write memory
+
+====================================================================================================
+>>> DEVICE: DXB-R1    PLATFORM: IOSv
+>>> Console of DXB-R1
+====================================================================================================
+! ---- STEP 0 (paste, then WAIT for the key-generation to finish) ----
+enable
+configure terminal
+hostname DXB-R1
+ip domain-name gulftech.local
+crypto key generate rsa modulus 2048
+! ---- STEP 1 (paste the rest) ----
+hostname DXB-R1
+no ip domain-lookup
+ip domain-name gulftech.local
+service password-encryption
+service timestamps debug datetime msec localtime
+service timestamps log datetime msec localtime
+service tcp-keepalives-in
+service tcp-keepalives-out
+no service pad
+no ip source-route
+no ip http server
+no ip http secure-server
+no ip bootp server
+no cdp run
+security passwords min-length 10
+login block-for 120 attempts 3 within 60
+login on-failure log
+login on-success log
+logging buffered 32768 informational
+logging console critical
+enable secret GulfTechEnable2026
+username netadmin privilege 15 secret GulfTechAdmin2026
+banner motd ^C
+*************************************************************
+  GULFTECH SOLUTIONS - AUTHORISED ACCESS ONLY
+  All activity is logged (AAA accounting). Disconnect now if
+  you are not an authorised administrator.
+*************************************************************
+^C
+ip ssh version 2
+ip ssh time-out 60
+ip ssh authentication-retries 3
+!
+! --- VTY management ACL (HQ MGMT + 3 branch MGMT VLANs + router loopbacks) ---
+ip access-list standard VTY-ACL
+ permit 10.10.2.160 0.0.0.31
+ permit 10.20.2.0 0.0.0.31
+ permit 10.30.2.0 0.0.0.31
+ permit 10.40.2.0 0.0.0.31
+ permit 10.255.0.0 0.0.3.255
+ deny   any log
+!
+! --- AAA: centralised TACACS+ with local fallback (Task 6) ---
+aaa new-model
+tacacs server TAC1
+ address ipv4 10.10.2.130
+ key GulfTechTacKey2026
+ timeout 3
+aaa group server tacacs+ TACACS-GRP
+ server name TAC1
+ip tacacs source-interface Loopback0
+aaa authentication login VTY-AUTH group TACACS-GRP local
+aaa authentication login CON-AUTH local
+aaa authorization exec VTY-AUTHZ group TACACS-GRP local
+aaa authorization exec CON-AUTHZ local
+aaa accounting exec ACC-EXEC start-stop group TACACS-GRP
+aaa accounting commands 1 ACC-CMD1 start-stop group TACACS-GRP
+aaa accounting commands 15 ACC-CMD15 start-stop group TACACS-GRP
+aaa session-id common
+!
+line con 0
+ login authentication CON-AUTH
+ authorization exec CON-AUTHZ
+ exec-timeout 5 0
+ logging synchronous
+line vty 0 4
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ accounting commands 1 ACC-CMD1
+ accounting commands 15 ACC-CMD15
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+ logging synchronous
+!
+interface Loopback0
+ description Router-ID / management / TACACS source
+ ip address 10.255.0.2 255.255.255.255
+interface GigabitEthernet0/0
+ description Trunk to DXB-SW1-Gi0/0
+ no ip address
+ no shutdown
+interface GigabitEthernet0/0.10
+ description HR
+ encapsulation dot1Q 10
+ ip address 10.20.1.193 255.255.255.192
+ no ip redirects
+ no ip proxy-arp
+interface GigabitEthernet0/0.20
+ description MARKETING
+ encapsulation dot1Q 20
+ ip address 10.20.1.129 255.255.255.192
+ no ip redirects
+ no ip proxy-arp
+interface GigabitEthernet0/0.30
+ description SALES
+ encapsulation dot1Q 30
+ ip address 10.20.1.1 255.255.255.128
+ no ip redirects
+ no ip proxy-arp
+interface GigabitEthernet0/0.99
+ description MANAGEMENT
+ encapsulation dot1Q 99
+ ip address 10.20.2.1 255.255.255.224
+ no ip redirects
+ no ip proxy-arp
+interface GigabitEthernet0/0.999
+ description NATIVE (unused, blackhole)
+ encapsulation dot1Q 999 native
+interface GigabitEthernet0/1
+ description ISP1 PRIMARY
+ ip address 198.51.100.6 255.255.255.252
+ ip access-group WAN-IN-1 in
+ ip verify unicast source reachable-via rx
+ no ip redirects
+ no ip unreachables
+ no ip proxy-arp
+ no shutdown
+interface GigabitEthernet0/2
+ description ISP2 BACKUP
+ ip address 192.0.2.22 255.255.255.252
+ ip access-group WAN-IN-2 in
+ ip verify unicast source reachable-via rx
+ no ip redirects
+ no ip unreachables
+ no ip proxy-arp
+ no shutdown
+!
+ip access-list extended WAN-IN-1
+ remark --- anti-spoofing: bogons and our own public space may never arrive from the Internet
+ deny   ip 0.0.0.0 0.255.255.255 any
+ deny   ip 10.0.0.0 0.255.255.255 any
+ deny   ip 127.0.0.0 0.255.255.255 any
+ deny   ip 169.254.0.0 0.0.255.255 any
+ deny   ip 172.16.0.0 0.15.255.255 any
+ deny   ip 192.168.0.0 0.0.255.255 any
+ deny   ip 224.0.0.0 15.255.255.255 any
+ remark --- IPsec (IKEv2 + ESP + NAT-T) only from known VPN peers
+ permit esp host 198.51.100.2 host 198.51.100.6
+ permit udp host 198.51.100.2 host 198.51.100.6 eq isakmp
+ permit udp host 198.51.100.2 host 198.51.100.6 eq non500-isakmp
+ remark --- diagnostics
+ permit icmp any host 198.51.100.6 echo
+ permit icmp any any echo-reply
+ permit icmp any any unreachable
+ permit icmp any any time-exceeded
+ deny   ip any any log
+!
+ip access-list extended WAN-IN-2
+ remark --- anti-spoofing: bogons and our own public space may never arrive from the Internet
+ deny   ip 0.0.0.0 0.255.255.255 any
+ deny   ip 10.0.0.0 0.255.255.255 any
+ deny   ip 127.0.0.0 0.255.255.255 any
+ deny   ip 169.254.0.0 0.0.255.255 any
+ deny   ip 172.16.0.0 0.15.255.255 any
+ deny   ip 192.168.0.0 0.0.255.255 any
+ deny   ip 224.0.0.0 15.255.255.255 any
+ remark --- IPsec (IKEv2 + ESP + NAT-T) only from known VPN peers
+ permit esp host 192.0.2.18 host 192.0.2.22
+ permit udp host 192.0.2.18 host 192.0.2.22 eq isakmp
+ permit udp host 192.0.2.18 host 192.0.2.22 eq non500-isakmp
+ remark --- diagnostics
+ permit icmp any host 192.0.2.22 echo
+ permit icmp any any echo-reply
+ permit icmp any any unreachable
+ permit icmp any any time-exceeded
+ deny   ip any any log
+!
+ip route 198.51.100.0 255.255.255.0 198.51.100.5
+ip route 192.0.2.16 255.255.255.240 192.0.2.21
+!
+ip dhcp excluded-address 10.20.1.193 10.20.1.193
+ip dhcp excluded-address 10.20.1.129 10.20.1.129
+ip dhcp excluded-address 10.20.1.1 10.20.1.9
+ip dhcp pool DXB-HR
+ network 10.20.1.192 255.255.255.192
+ default-router 10.20.1.193
+ip dhcp pool DXB-MKT
+ network 10.20.1.128 255.255.255.192
+ default-router 10.20.1.129
+ip dhcp pool DXB-SALES
+ network 10.20.1.0 255.255.255.128
+ default-router 10.20.1.1
+!
+! ================= IKEv2 / IPsec (Task 3) - spoke =================
+crypto ikev2 proposal PROP-AES256
+ encryption aes-cbc-256
+ integrity sha384
+ group 20
+crypto ikev2 policy POL-GT
+ proposal PROP-AES256
+crypto ikev2 dpd 10 3 periodic
+crypto ikev2 keyring KR-SPOKE
+ peer HQ-ISP1
+  address 198.51.100.2
+  pre-shared-key local S2DXB1Rk3Wd8Nc5Yh2026
+  pre-shared-key remote H2DXB1Qm7Zp4Lv9Bt2026
+ peer HQ-ISP2
+  address 192.0.2.18
+  pre-shared-key local S2DXB2Rk3Wd8Nc5Yh2026
+  pre-shared-key remote H2DXB2Qm7Zp4Lv9Bt2026
+crypto ikev2 profile IKEV2-PROF
+ match identity remote address 198.51.100.2 255.255.255.255
+ match identity remote address 192.0.2.18 255.255.255.255
+ authentication local pre-share
+ authentication remote pre-share
+ keyring local KR-SPOKE
+ lifetime 28800
+crypto ipsec transform-set TS-AES256 esp-aes 256 esp-sha384-hmac
+ mode tunnel
+crypto ipsec profile IPSEC-PROF
+ set transform-set TS-AES256
+ set ikev2-profile IKEV2-PROF
+ set pfs group20
+ set security-association lifetime seconds 3600
+interface Tunnel1
+ description VPN to HQ via ISP1 (PRIMARY)
+ ip address 10.255.1.2 255.255.255.252
+ ip mtu 1400
+ ip tcp adjust-mss 1360
+ bandwidth 10000
+ delay 1000
+ ip hello-interval eigrp 100 3
+ ip hold-time eigrp 100 9
+ tunnel source GigabitEthernet0/1
+ tunnel destination 198.51.100.2
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-PROF
+ no shutdown
+interface Tunnel2
+ description VPN to HQ via ISP2 (BACKUP)
+ ip address 10.255.2.2 255.255.255.252
+ ip mtu 1400
+ ip tcp adjust-mss 1360
+ bandwidth 10000
+ delay 5000
+ ip hello-interval eigrp 100 3
+ ip hold-time eigrp 100 9
+ tunnel source GigabitEthernet0/2
+ tunnel destination 192.0.2.18
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-PROF
+ no shutdown
+!
+router eigrp 100
+ eigrp router-id 10.255.0.2
+ network 10.255.0.2 0.0.0.0
+ network 10.255.1.0 0.0.0.255
+ network 10.255.2.0 0.0.0.255
+ network 10.20.0.0 0.0.255.255
+ passive-interface default
+ no passive-interface Tunnel1
+ no passive-interface Tunnel2
+!
+end
+write memory
+
+====================================================================================================
+>>> DEVICE: DXB-SW1    PLATFORM: IOSvL2
+>>> Console of DXB-SW1
+====================================================================================================
+! ---- STEP 0 (paste, then WAIT for the key-generation to finish) ----
+enable
+configure terminal
+hostname DXB-SW1
+ip domain-name gulftech.local
+crypto key generate rsa modulus 2048
+! ---- STEP 1 (paste the rest) ----
+hostname DXB-SW1
+no ip domain-lookup
+ip domain-name gulftech.local
+service password-encryption
+service timestamps debug datetime msec localtime
+service timestamps log datetime msec localtime
+no service pad
+no ip http server
+no ip http secure-server
+no cdp run
+login block-for 120 attempts 3 within 60
+login on-failure log
+login on-success log
+logging buffered 32768 informational
+logging console critical
+enable secret GulfTechEnable2026
+username netadmin privilege 15 secret GulfTechAdmin2026
+banner motd ^C
+*************************************************************
+  GULFTECH SOLUTIONS - AUTHORISED ACCESS ONLY
+  All activity is logged (AAA accounting). Disconnect now if
+  you are not an authorised administrator.
+*************************************************************
+^C
+vtp mode transparent
+ip ssh version 2
+ip ssh time-out 60
+ip ssh authentication-retries 3
+spanning-tree mode rapid-pvst
+spanning-tree extend system-id
+spanning-tree portfast bpduguard default
+spanning-tree loopguard default
+errdisable recovery cause bpduguard
+errdisable recovery cause psecure-violation
+errdisable recovery cause storm-control
+errdisable recovery interval 300
+ip dhcp snooping
+no ip dhcp snooping information option
+ip arp inspection validate src-mac dst-mac ip
+ip default-gateway 10.20.2.1
+!
+interface Vlan99
+ description MANAGEMENT SVI
+ ip address 10.20.2.2 255.255.255.224
+ no shutdown
+vlan 10
+ name HR
+vlan 20
+ name MARKETING
+vlan 30
+ name SALES
+vlan 99
+ name MANAGEMENT
+vlan 998
+ name PARKING-BLACKHOLE
+vlan 999
+ name NATIVE-UNUSED
+ip dhcp snooping vlan 10,20,30
+ip arp inspection vlan 10,20,30
+!
+interface GigabitEthernet0/0
+ description Trunk to DXB-R1-Gi0/0
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 999
+ switchport trunk allowed vlan 10,20,30,99
+ switchport mode trunk
+ switchport nonegotiate
+ ip dhcp snooping trust
+ ip arp inspection trust
+ no shutdown
+interface GigabitEthernet0/1
+ description HR-PC
+ switchport mode access
+ switchport access vlan 10
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ ip dhcp snooping limit rate 15
+ ip verify source
+ no shutdown
+interface GigabitEthernet0/2
+ description MKT-PC
+ switchport mode access
+ switchport access vlan 20
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ ip dhcp snooping limit rate 15
+ ip verify source
+ no shutdown
+interface GigabitEthernet0/3
+ description SALES-PC
+ switchport mode access
+ switchport access vlan 30
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ ip dhcp snooping limit rate 15
+ ip verify source
+ no shutdown
+interface GigabitEthernet1/0
+ description DXB-USER-01 workstation (MGMT VLAN, 10.20.2.10)
+ switchport mode access
+ switchport access vlan 99
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ no shutdown
+interface range GigabitEthernet1/1 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+interface range GigabitEthernet2/0 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+interface range GigabitEthernet3/0 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+!
+! --- VTY management ACL (HQ MGMT + 3 branch MGMT VLANs + router loopbacks) ---
+ip access-list standard VTY-ACL
+ permit 10.10.2.160 0.0.0.31
+ permit 10.20.2.0 0.0.0.31
+ permit 10.30.2.0 0.0.0.31
+ permit 10.40.2.0 0.0.0.31
+ permit 10.255.0.0 0.0.3.255
+ deny   any log
+!
+! --- AAA: centralised TACACS+ with local fallback (Task 6) ---
+aaa new-model
+tacacs server TAC1
+ address ipv4 10.10.2.130
+ key GulfTechTacKey2026
+ timeout 3
+aaa group server tacacs+ TACACS-GRP
+ server name TAC1
+ip tacacs source-interface Vlan99
+aaa authentication login VTY-AUTH group TACACS-GRP local
+aaa authentication login CON-AUTH local
+aaa authorization exec VTY-AUTHZ group TACACS-GRP local
+aaa authorization exec CON-AUTHZ local
+aaa accounting exec ACC-EXEC start-stop group TACACS-GRP
+aaa accounting commands 1 ACC-CMD1 start-stop group TACACS-GRP
+aaa accounting commands 15 ACC-CMD15 start-stop group TACACS-GRP
+aaa session-id common
+!
+line con 0
+ login authentication CON-AUTH
+ authorization exec CON-AUTHZ
+ exec-timeout 5 0
+ logging synchronous
+line vty 0 4
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ accounting commands 1 ACC-CMD1
+ accounting commands 15 ACC-CMD15
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+ logging synchronous
+line vty 5 15
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+end
+write memory
+
+====================================================================================================
+>>> DEVICE: RUH-R1    PLATFORM: IOSv
+>>> Console of RUH-R1
+====================================================================================================
+! ---- STEP 0 (paste, then WAIT for the key-generation to finish) ----
+enable
+configure terminal
+hostname RUH-R1
+ip domain-name gulftech.local
+crypto key generate rsa modulus 2048
+! ---- STEP 1 (paste the rest) ----
+hostname RUH-R1
+no ip domain-lookup
+ip domain-name gulftech.local
+service password-encryption
+service timestamps debug datetime msec localtime
+service timestamps log datetime msec localtime
+service tcp-keepalives-in
+service tcp-keepalives-out
+no service pad
+no ip source-route
+no ip http server
+no ip http secure-server
+no ip bootp server
+no cdp run
+security passwords min-length 10
+login block-for 120 attempts 3 within 60
+login on-failure log
+login on-success log
+logging buffered 32768 informational
+logging console critical
+enable secret GulfTechEnable2026
+username netadmin privilege 15 secret GulfTechAdmin2026
+banner motd ^C
+*************************************************************
+  GULFTECH SOLUTIONS - AUTHORISED ACCESS ONLY
+  All activity is logged (AAA accounting). Disconnect now if
+  you are not an authorised administrator.
+*************************************************************
+^C
+ip ssh version 2
+ip ssh time-out 60
+ip ssh authentication-retries 3
+!
+! --- VTY management ACL (HQ MGMT + 3 branch MGMT VLANs + router loopbacks) ---
+ip access-list standard VTY-ACL
+ permit 10.10.2.160 0.0.0.31
+ permit 10.20.2.0 0.0.0.31
+ permit 10.30.2.0 0.0.0.31
+ permit 10.40.2.0 0.0.0.31
+ permit 10.255.0.0 0.0.3.255
+ deny   any log
+!
+! --- AAA: centralised TACACS+ with local fallback (Task 6) ---
+aaa new-model
+tacacs server TAC1
+ address ipv4 10.10.2.130
+ key GulfTechTacKey2026
+ timeout 3
+aaa group server tacacs+ TACACS-GRP
+ server name TAC1
+ip tacacs source-interface Loopback0
+aaa authentication login VTY-AUTH group TACACS-GRP local
+aaa authentication login CON-AUTH local
+aaa authorization exec VTY-AUTHZ group TACACS-GRP local
+aaa authorization exec CON-AUTHZ local
+aaa accounting exec ACC-EXEC start-stop group TACACS-GRP
+aaa accounting commands 1 ACC-CMD1 start-stop group TACACS-GRP
+aaa accounting commands 15 ACC-CMD15 start-stop group TACACS-GRP
+aaa session-id common
+!
+line con 0
+ login authentication CON-AUTH
+ authorization exec CON-AUTHZ
+ exec-timeout 5 0
+ logging synchronous
+line vty 0 4
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ accounting commands 1 ACC-CMD1
+ accounting commands 15 ACC-CMD15
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+ logging synchronous
+!
+interface Loopback0
+ description Router-ID / management / TACACS source
+ ip address 10.255.0.3 255.255.255.255
+interface GigabitEthernet0/0
+ description Trunk to RUH-SW1-Gi0/0
+ no ip address
+ no shutdown
+interface GigabitEthernet0/0.10
+ description HR
+ encapsulation dot1Q 10
+ ip address 10.30.1.193 255.255.255.192
+ no ip redirects
+ no ip proxy-arp
+interface GigabitEthernet0/0.20
+ description MARKETING
+ encapsulation dot1Q 20
+ ip address 10.30.1.129 255.255.255.192
+ no ip redirects
+ no ip proxy-arp
+interface GigabitEthernet0/0.30
+ description SALES
+ encapsulation dot1Q 30
+ ip address 10.30.1.1 255.255.255.128
+ no ip redirects
+ no ip proxy-arp
+interface GigabitEthernet0/0.99
+ description MANAGEMENT
+ encapsulation dot1Q 99
+ ip address 10.30.2.1 255.255.255.224
+ no ip redirects
+ no ip proxy-arp
+interface GigabitEthernet0/0.999
+ description NATIVE (unused, blackhole)
+ encapsulation dot1Q 999 native
+interface GigabitEthernet0/1
+ description ISP1 PRIMARY
+ ip address 198.51.100.10 255.255.255.252
+ ip access-group WAN-IN-1 in
+ ip verify unicast source reachable-via rx
+ no ip redirects
+ no ip unreachables
+ no ip proxy-arp
+ no shutdown
+interface GigabitEthernet0/2
+ description ISP2 BACKUP
+ ip address 192.0.2.26 255.255.255.252
+ ip access-group WAN-IN-2 in
+ ip verify unicast source reachable-via rx
+ no ip redirects
+ no ip unreachables
+ no ip proxy-arp
+ no shutdown
+!
+ip access-list extended WAN-IN-1
+ remark --- anti-spoofing: bogons and our own public space may never arrive from the Internet
+ deny   ip 0.0.0.0 0.255.255.255 any
+ deny   ip 10.0.0.0 0.255.255.255 any
+ deny   ip 127.0.0.0 0.255.255.255 any
+ deny   ip 169.254.0.0 0.0.255.255 any
+ deny   ip 172.16.0.0 0.15.255.255 any
+ deny   ip 192.168.0.0 0.0.255.255 any
+ deny   ip 224.0.0.0 15.255.255.255 any
+ remark --- IPsec (IKEv2 + ESP + NAT-T) only from known VPN peers
+ permit esp host 198.51.100.2 host 198.51.100.10
+ permit udp host 198.51.100.2 host 198.51.100.10 eq isakmp
+ permit udp host 198.51.100.2 host 198.51.100.10 eq non500-isakmp
+ remark --- diagnostics
+ permit icmp any host 198.51.100.10 echo
+ permit icmp any any echo-reply
+ permit icmp any any unreachable
+ permit icmp any any time-exceeded
+ deny   ip any any log
+!
+ip access-list extended WAN-IN-2
+ remark --- anti-spoofing: bogons and our own public space may never arrive from the Internet
+ deny   ip 0.0.0.0 0.255.255.255 any
+ deny   ip 10.0.0.0 0.255.255.255 any
+ deny   ip 127.0.0.0 0.255.255.255 any
+ deny   ip 169.254.0.0 0.0.255.255 any
+ deny   ip 172.16.0.0 0.15.255.255 any
+ deny   ip 192.168.0.0 0.0.255.255 any
+ deny   ip 224.0.0.0 15.255.255.255 any
+ remark --- IPsec (IKEv2 + ESP + NAT-T) only from known VPN peers
+ permit esp host 192.0.2.18 host 192.0.2.26
+ permit udp host 192.0.2.18 host 192.0.2.26 eq isakmp
+ permit udp host 192.0.2.18 host 192.0.2.26 eq non500-isakmp
+ remark --- diagnostics
+ permit icmp any host 192.0.2.26 echo
+ permit icmp any any echo-reply
+ permit icmp any any unreachable
+ permit icmp any any time-exceeded
+ deny   ip any any log
+!
+ip route 198.51.100.0 255.255.255.0 198.51.100.9
+ip route 192.0.2.16 255.255.255.240 192.0.2.25
+!
+ip dhcp excluded-address 10.30.1.193 10.30.1.193
+ip dhcp excluded-address 10.30.1.129 10.30.1.129
+ip dhcp excluded-address 10.30.1.1 10.30.1.9
+ip dhcp pool RUH-HR
+ network 10.30.1.192 255.255.255.192
+ default-router 10.30.1.193
+ip dhcp pool RUH-MKT
+ network 10.30.1.128 255.255.255.192
+ default-router 10.30.1.129
+ip dhcp pool RUH-SALES
+ network 10.30.1.0 255.255.255.128
+ default-router 10.30.1.1
+!
+! ================= IKEv2 / IPsec (Task 3) - spoke =================
+crypto ikev2 proposal PROP-AES256
+ encryption aes-cbc-256
+ integrity sha384
+ group 20
+crypto ikev2 policy POL-GT
+ proposal PROP-AES256
+crypto ikev2 dpd 10 3 periodic
+crypto ikev2 keyring KR-SPOKE
+ peer HQ-ISP1
+  address 198.51.100.2
+  pre-shared-key local S2RUH1Rk3Wd8Nc5Yh2026
+  pre-shared-key remote H2RUH1Qm7Zp4Lv9Bt2026
+ peer HQ-ISP2
+  address 192.0.2.18
+  pre-shared-key local S2RUH2Rk3Wd8Nc5Yh2026
+  pre-shared-key remote H2RUH2Qm7Zp4Lv9Bt2026
+crypto ikev2 profile IKEV2-PROF
+ match identity remote address 198.51.100.2 255.255.255.255
+ match identity remote address 192.0.2.18 255.255.255.255
+ authentication local pre-share
+ authentication remote pre-share
+ keyring local KR-SPOKE
+ lifetime 28800
+crypto ipsec transform-set TS-AES256 esp-aes 256 esp-sha384-hmac
+ mode tunnel
+crypto ipsec profile IPSEC-PROF
+ set transform-set TS-AES256
+ set ikev2-profile IKEV2-PROF
+ set pfs group20
+ set security-association lifetime seconds 3600
+interface Tunnel1
+ description VPN to HQ via ISP1 (PRIMARY)
+ ip address 10.255.1.6 255.255.255.252
+ ip mtu 1400
+ ip tcp adjust-mss 1360
+ bandwidth 10000
+ delay 1000
+ ip hello-interval eigrp 100 3
+ ip hold-time eigrp 100 9
+ tunnel source GigabitEthernet0/1
+ tunnel destination 198.51.100.2
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-PROF
+ no shutdown
+interface Tunnel2
+ description VPN to HQ via ISP2 (BACKUP)
+ ip address 10.255.2.6 255.255.255.252
+ ip mtu 1400
+ ip tcp adjust-mss 1360
+ bandwidth 10000
+ delay 5000
+ ip hello-interval eigrp 100 3
+ ip hold-time eigrp 100 9
+ tunnel source GigabitEthernet0/2
+ tunnel destination 192.0.2.18
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-PROF
+ no shutdown
+!
+router eigrp 100
+ eigrp router-id 10.255.0.3
+ network 10.255.0.3 0.0.0.0
+ network 10.255.1.0 0.0.0.255
+ network 10.255.2.0 0.0.0.255
+ network 10.30.0.0 0.0.255.255
+ passive-interface default
+ no passive-interface Tunnel1
+ no passive-interface Tunnel2
+!
+end
+write memory
+
+====================================================================================================
+>>> DEVICE: RUH-SW1    PLATFORM: IOSvL2
+>>> Console of RUH-SW1
+====================================================================================================
+! ---- STEP 0 (paste, then WAIT for the key-generation to finish) ----
+enable
+configure terminal
+hostname RUH-SW1
+ip domain-name gulftech.local
+crypto key generate rsa modulus 2048
+! ---- STEP 1 (paste the rest) ----
+hostname RUH-SW1
+no ip domain-lookup
+ip domain-name gulftech.local
+service password-encryption
+service timestamps debug datetime msec localtime
+service timestamps log datetime msec localtime
+no service pad
+no ip http server
+no ip http secure-server
+no cdp run
+login block-for 120 attempts 3 within 60
+login on-failure log
+login on-success log
+logging buffered 32768 informational
+logging console critical
+enable secret GulfTechEnable2026
+username netadmin privilege 15 secret GulfTechAdmin2026
+banner motd ^C
+*************************************************************
+  GULFTECH SOLUTIONS - AUTHORISED ACCESS ONLY
+  All activity is logged (AAA accounting). Disconnect now if
+  you are not an authorised administrator.
+*************************************************************
+^C
+vtp mode transparent
+ip ssh version 2
+ip ssh time-out 60
+ip ssh authentication-retries 3
+spanning-tree mode rapid-pvst
+spanning-tree extend system-id
+spanning-tree portfast bpduguard default
+spanning-tree loopguard default
+errdisable recovery cause bpduguard
+errdisable recovery cause psecure-violation
+errdisable recovery cause storm-control
+errdisable recovery interval 300
+ip dhcp snooping
+no ip dhcp snooping information option
+ip arp inspection validate src-mac dst-mac ip
+ip default-gateway 10.30.2.1
+!
+interface Vlan99
+ description MANAGEMENT SVI
+ ip address 10.30.2.2 255.255.255.224
+ no shutdown
+vlan 10
+ name HR
+vlan 20
+ name MARKETING
+vlan 30
+ name SALES
+vlan 99
+ name MANAGEMENT
+vlan 998
+ name PARKING-BLACKHOLE
+vlan 999
+ name NATIVE-UNUSED
+ip dhcp snooping vlan 10,20,30
+ip arp inspection vlan 10,20,30
+!
+interface GigabitEthernet0/0
+ description Trunk to RUH-R1-Gi0/0
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 999
+ switchport trunk allowed vlan 10,20,30,99
+ switchport mode trunk
+ switchport nonegotiate
+ ip dhcp snooping trust
+ ip arp inspection trust
+ no shutdown
+interface GigabitEthernet0/1
+ description HR-PC
+ switchport mode access
+ switchport access vlan 10
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ ip dhcp snooping limit rate 15
+ ip verify source
+ no shutdown
+interface GigabitEthernet0/2
+ description MKT-PC
+ switchport mode access
+ switchport access vlan 20
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ ip dhcp snooping limit rate 15
+ ip verify source
+ no shutdown
+interface GigabitEthernet0/3
+ description SALES-PC
+ switchport mode access
+ switchport access vlan 30
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ ip dhcp snooping limit rate 15
+ ip verify source
+ no shutdown
+interface GigabitEthernet1/0
+ description RUH-USER-01 workstation (MGMT VLAN, 10.30.2.10)
+ switchport mode access
+ switchport access vlan 99
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ no shutdown
+interface range GigabitEthernet1/1 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+interface range GigabitEthernet2/0 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+interface range GigabitEthernet3/0 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+!
+! --- VTY management ACL (HQ MGMT + 3 branch MGMT VLANs + router loopbacks) ---
+ip access-list standard VTY-ACL
+ permit 10.10.2.160 0.0.0.31
+ permit 10.20.2.0 0.0.0.31
+ permit 10.30.2.0 0.0.0.31
+ permit 10.40.2.0 0.0.0.31
+ permit 10.255.0.0 0.0.3.255
+ deny   any log
+!
+! --- AAA: centralised TACACS+ with local fallback (Task 6) ---
+aaa new-model
+tacacs server TAC1
+ address ipv4 10.10.2.130
+ key GulfTechTacKey2026
+ timeout 3
+aaa group server tacacs+ TACACS-GRP
+ server name TAC1
+ip tacacs source-interface Vlan99
+aaa authentication login VTY-AUTH group TACACS-GRP local
+aaa authentication login CON-AUTH local
+aaa authorization exec VTY-AUTHZ group TACACS-GRP local
+aaa authorization exec CON-AUTHZ local
+aaa accounting exec ACC-EXEC start-stop group TACACS-GRP
+aaa accounting commands 1 ACC-CMD1 start-stop group TACACS-GRP
+aaa accounting commands 15 ACC-CMD15 start-stop group TACACS-GRP
+aaa session-id common
+!
+line con 0
+ login authentication CON-AUTH
+ authorization exec CON-AUTHZ
+ exec-timeout 5 0
+ logging synchronous
+line vty 0 4
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ accounting commands 1 ACC-CMD1
+ accounting commands 15 ACC-CMD15
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+ logging synchronous
+line vty 5 15
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+end
+write memory
+
+====================================================================================================
+>>> DEVICE: DOH-R1    PLATFORM: IOSv
+>>> Console of DOH-R1
+====================================================================================================
+! ---- STEP 0 (paste, then WAIT for the key-generation to finish) ----
+enable
+configure terminal
+hostname DOH-R1
+ip domain-name gulftech.local
+crypto key generate rsa modulus 2048
+! ---- STEP 1 (paste the rest) ----
+hostname DOH-R1
+no ip domain-lookup
+ip domain-name gulftech.local
+service password-encryption
+service timestamps debug datetime msec localtime
+service timestamps log datetime msec localtime
+service tcp-keepalives-in
+service tcp-keepalives-out
+no service pad
+no ip source-route
+no ip http server
+no ip http secure-server
+no ip bootp server
+no cdp run
+security passwords min-length 10
+login block-for 120 attempts 3 within 60
+login on-failure log
+login on-success log
+logging buffered 32768 informational
+logging console critical
+enable secret GulfTechEnable2026
+username netadmin privilege 15 secret GulfTechAdmin2026
+banner motd ^C
+*************************************************************
+  GULFTECH SOLUTIONS - AUTHORISED ACCESS ONLY
+  All activity is logged (AAA accounting). Disconnect now if
+  you are not an authorised administrator.
+*************************************************************
+^C
+ip ssh version 2
+ip ssh time-out 60
+ip ssh authentication-retries 3
+!
+! --- VTY management ACL (HQ MGMT + 3 branch MGMT VLANs + router loopbacks) ---
+ip access-list standard VTY-ACL
+ permit 10.10.2.160 0.0.0.31
+ permit 10.20.2.0 0.0.0.31
+ permit 10.30.2.0 0.0.0.31
+ permit 10.40.2.0 0.0.0.31
+ permit 10.255.0.0 0.0.3.255
+ deny   any log
+!
+! --- AAA: centralised TACACS+ with local fallback (Task 6) ---
+aaa new-model
+tacacs server TAC1
+ address ipv4 10.10.2.130
+ key GulfTechTacKey2026
+ timeout 3
+aaa group server tacacs+ TACACS-GRP
+ server name TAC1
+ip tacacs source-interface Loopback0
+aaa authentication login VTY-AUTH group TACACS-GRP local
+aaa authentication login CON-AUTH local
+aaa authorization exec VTY-AUTHZ group TACACS-GRP local
+aaa authorization exec CON-AUTHZ local
+aaa accounting exec ACC-EXEC start-stop group TACACS-GRP
+aaa accounting commands 1 ACC-CMD1 start-stop group TACACS-GRP
+aaa accounting commands 15 ACC-CMD15 start-stop group TACACS-GRP
+aaa session-id common
+!
+line con 0
+ login authentication CON-AUTH
+ authorization exec CON-AUTHZ
+ exec-timeout 5 0
+ logging synchronous
+line vty 0 4
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ accounting commands 1 ACC-CMD1
+ accounting commands 15 ACC-CMD15
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+ logging synchronous
+!
+interface Loopback0
+ description Router-ID / management / TACACS source
+ ip address 10.255.0.4 255.255.255.255
+interface GigabitEthernet0/0
+ description Trunk to DOH-SW1-Gi0/0
+ no ip address
+ no shutdown
+interface GigabitEthernet0/0.10
+ description HR
+ encapsulation dot1Q 10
+ ip address 10.40.1.97 255.255.255.224
+ no ip redirects
+ no ip proxy-arp
+interface GigabitEthernet0/0.20
+ description MARKETING
+ encapsulation dot1Q 20
+ ip address 10.40.1.65 255.255.255.224
+ no ip redirects
+ no ip proxy-arp
+interface GigabitEthernet0/0.30
+ description SALES
+ encapsulation dot1Q 30
+ ip address 10.40.1.1 255.255.255.192
+ no ip redirects
+ no ip proxy-arp
+interface GigabitEthernet0/0.99
+ description MANAGEMENT
+ encapsulation dot1Q 99
+ ip address 10.40.2.1 255.255.255.224
+ no ip redirects
+ no ip proxy-arp
+interface GigabitEthernet0/0.999
+ description NATIVE (unused, blackhole)
+ encapsulation dot1Q 999 native
+interface GigabitEthernet0/1
+ description ISP1 PRIMARY
+ ip address 198.51.100.14 255.255.255.252
+ ip access-group WAN-IN-1 in
+ ip verify unicast source reachable-via rx
+ no ip redirects
+ no ip unreachables
+ no ip proxy-arp
+ no shutdown
+interface GigabitEthernet0/2
+ description ISP2 BACKUP
+ ip address 192.0.2.30 255.255.255.252
+ ip access-group WAN-IN-2 in
+ ip verify unicast source reachable-via rx
+ no ip redirects
+ no ip unreachables
+ no ip proxy-arp
+ no shutdown
+!
+ip access-list extended WAN-IN-1
+ remark --- anti-spoofing: bogons and our own public space may never arrive from the Internet
+ deny   ip 0.0.0.0 0.255.255.255 any
+ deny   ip 10.0.0.0 0.255.255.255 any
+ deny   ip 127.0.0.0 0.255.255.255 any
+ deny   ip 169.254.0.0 0.0.255.255 any
+ deny   ip 172.16.0.0 0.15.255.255 any
+ deny   ip 192.168.0.0 0.0.255.255 any
+ deny   ip 224.0.0.0 15.255.255.255 any
+ remark --- IPsec (IKEv2 + ESP + NAT-T) only from known VPN peers
+ permit esp host 198.51.100.2 host 198.51.100.14
+ permit udp host 198.51.100.2 host 198.51.100.14 eq isakmp
+ permit udp host 198.51.100.2 host 198.51.100.14 eq non500-isakmp
+ remark --- diagnostics
+ permit icmp any host 198.51.100.14 echo
+ permit icmp any any echo-reply
+ permit icmp any any unreachable
+ permit icmp any any time-exceeded
+ deny   ip any any log
+!
+ip access-list extended WAN-IN-2
+ remark --- anti-spoofing: bogons and our own public space may never arrive from the Internet
+ deny   ip 0.0.0.0 0.255.255.255 any
+ deny   ip 10.0.0.0 0.255.255.255 any
+ deny   ip 127.0.0.0 0.255.255.255 any
+ deny   ip 169.254.0.0 0.0.255.255 any
+ deny   ip 172.16.0.0 0.15.255.255 any
+ deny   ip 192.168.0.0 0.0.255.255 any
+ deny   ip 224.0.0.0 15.255.255.255 any
+ remark --- IPsec (IKEv2 + ESP + NAT-T) only from known VPN peers
+ permit esp host 192.0.2.18 host 192.0.2.30
+ permit udp host 192.0.2.18 host 192.0.2.30 eq isakmp
+ permit udp host 192.0.2.18 host 192.0.2.30 eq non500-isakmp
+ remark --- diagnostics
+ permit icmp any host 192.0.2.30 echo
+ permit icmp any any echo-reply
+ permit icmp any any unreachable
+ permit icmp any any time-exceeded
+ deny   ip any any log
+!
+ip route 198.51.100.0 255.255.255.0 198.51.100.13
+ip route 192.0.2.16 255.255.255.240 192.0.2.29
+!
+ip dhcp excluded-address 10.40.1.97 10.40.1.97
+ip dhcp excluded-address 10.40.1.65 10.40.1.65
+ip dhcp excluded-address 10.40.1.1 10.40.1.9
+ip dhcp pool DOH-HR
+ network 10.40.1.96 255.255.255.224
+ default-router 10.40.1.97
+ip dhcp pool DOH-MKT
+ network 10.40.1.64 255.255.255.224
+ default-router 10.40.1.65
+ip dhcp pool DOH-SALES
+ network 10.40.1.0 255.255.255.192
+ default-router 10.40.1.1
+!
+! ================= IKEv2 / IPsec (Task 3) - spoke =================
+crypto ikev2 proposal PROP-AES256
+ encryption aes-cbc-256
+ integrity sha384
+ group 20
+crypto ikev2 policy POL-GT
+ proposal PROP-AES256
+crypto ikev2 dpd 10 3 periodic
+crypto ikev2 keyring KR-SPOKE
+ peer HQ-ISP1
+  address 198.51.100.2
+  pre-shared-key local S2DOH1Rk3Wd8Nc5Yh2026
+  pre-shared-key remote H2DOH1Qm7Zp4Lv9Bt2026
+ peer HQ-ISP2
+  address 192.0.2.18
+  pre-shared-key local S2DOH2Rk3Wd8Nc5Yh2026
+  pre-shared-key remote H2DOH2Qm7Zp4Lv9Bt2026
+crypto ikev2 profile IKEV2-PROF
+ match identity remote address 198.51.100.2 255.255.255.255
+ match identity remote address 192.0.2.18 255.255.255.255
+ authentication local pre-share
+ authentication remote pre-share
+ keyring local KR-SPOKE
+ lifetime 28800
+crypto ipsec transform-set TS-AES256 esp-aes 256 esp-sha384-hmac
+ mode tunnel
+crypto ipsec profile IPSEC-PROF
+ set transform-set TS-AES256
+ set ikev2-profile IKEV2-PROF
+ set pfs group20
+ set security-association lifetime seconds 3600
+interface Tunnel1
+ description VPN to HQ via ISP1 (PRIMARY)
+ ip address 10.255.1.10 255.255.255.252
+ ip mtu 1400
+ ip tcp adjust-mss 1360
+ bandwidth 10000
+ delay 1000
+ ip hello-interval eigrp 100 3
+ ip hold-time eigrp 100 9
+ tunnel source GigabitEthernet0/1
+ tunnel destination 198.51.100.2
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-PROF
+ no shutdown
+interface Tunnel2
+ description VPN to HQ via ISP2 (BACKUP)
+ ip address 10.255.2.10 255.255.255.252
+ ip mtu 1400
+ ip tcp adjust-mss 1360
+ bandwidth 10000
+ delay 5000
+ ip hello-interval eigrp 100 3
+ ip hold-time eigrp 100 9
+ tunnel source GigabitEthernet0/2
+ tunnel destination 192.0.2.18
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-PROF
+ no shutdown
+!
+router eigrp 100
+ eigrp router-id 10.255.0.4
+ network 10.255.0.4 0.0.0.0
+ network 10.255.1.0 0.0.0.255
+ network 10.255.2.0 0.0.0.255
+ network 10.40.0.0 0.0.255.255
+ passive-interface default
+ no passive-interface Tunnel1
+ no passive-interface Tunnel2
+!
+end
+write memory
+
+====================================================================================================
+>>> DEVICE: DOH-SW1    PLATFORM: IOSvL2
+>>> Console of DOH-SW1
+====================================================================================================
+! ---- STEP 0 (paste, then WAIT for the key-generation to finish) ----
+enable
+configure terminal
+hostname DOH-SW1
+ip domain-name gulftech.local
+crypto key generate rsa modulus 2048
+! ---- STEP 1 (paste the rest) ----
+hostname DOH-SW1
+no ip domain-lookup
+ip domain-name gulftech.local
+service password-encryption
+service timestamps debug datetime msec localtime
+service timestamps log datetime msec localtime
+no service pad
+no ip http server
+no ip http secure-server
+no cdp run
+login block-for 120 attempts 3 within 60
+login on-failure log
+login on-success log
+logging buffered 32768 informational
+logging console critical
+enable secret GulfTechEnable2026
+username netadmin privilege 15 secret GulfTechAdmin2026
+banner motd ^C
+*************************************************************
+  GULFTECH SOLUTIONS - AUTHORISED ACCESS ONLY
+  All activity is logged (AAA accounting). Disconnect now if
+  you are not an authorised administrator.
+*************************************************************
+^C
+vtp mode transparent
+ip ssh version 2
+ip ssh time-out 60
+ip ssh authentication-retries 3
+spanning-tree mode rapid-pvst
+spanning-tree extend system-id
+spanning-tree portfast bpduguard default
+spanning-tree loopguard default
+errdisable recovery cause bpduguard
+errdisable recovery cause psecure-violation
+errdisable recovery cause storm-control
+errdisable recovery interval 300
+ip dhcp snooping
+no ip dhcp snooping information option
+ip arp inspection validate src-mac dst-mac ip
+ip default-gateway 10.40.2.1
+!
+interface Vlan99
+ description MANAGEMENT SVI
+ ip address 10.40.2.2 255.255.255.224
+ no shutdown
+vlan 10
+ name HR
+vlan 20
+ name MARKETING
+vlan 30
+ name SALES
+vlan 99
+ name MANAGEMENT
+vlan 998
+ name PARKING-BLACKHOLE
+vlan 999
+ name NATIVE-UNUSED
+ip dhcp snooping vlan 10,20,30
+ip arp inspection vlan 10,20,30
+!
+interface GigabitEthernet0/0
+ description Trunk to DOH-R1-Gi0/0
+ switchport trunk encapsulation dot1q
+ switchport trunk native vlan 999
+ switchport trunk allowed vlan 10,20,30,99
+ switchport mode trunk
+ switchport nonegotiate
+ ip dhcp snooping trust
+ ip arp inspection trust
+ no shutdown
+interface GigabitEthernet0/1
+ description HR-PC
+ switchport mode access
+ switchport access vlan 10
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ ip dhcp snooping limit rate 15
+ ip verify source
+ no shutdown
+interface GigabitEthernet0/2
+ description MKT-PC
+ switchport mode access
+ switchport access vlan 20
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ ip dhcp snooping limit rate 15
+ ip verify source
+ no shutdown
+interface GigabitEthernet0/3
+ description SALES-PC
+ switchport mode access
+ switchport access vlan 30
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ ip dhcp snooping limit rate 15
+ ip verify source
+ no shutdown
+interface GigabitEthernet1/0
+ description DOH-USER-01 workstation (MGMT VLAN, 10.40.2.10)
+ switchport mode access
+ switchport access vlan 99
+ switchport nonegotiate
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation shutdown
+ switchport port-security mac-address sticky
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ no cdp enable
+ storm-control broadcast level 10.00
+ storm-control multicast level 10.00
+ storm-control action shutdown
+ no shutdown
+interface range GigabitEthernet1/1 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+interface range GigabitEthernet2/0 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+interface range GigabitEthernet3/0 - 3
+ description UNUSED - parked in blackhole VLAN
+ switchport mode access
+ switchport access vlan 998
+ shutdown
+!
+! --- VTY management ACL (HQ MGMT + 3 branch MGMT VLANs + router loopbacks) ---
+ip access-list standard VTY-ACL
+ permit 10.10.2.160 0.0.0.31
+ permit 10.20.2.0 0.0.0.31
+ permit 10.30.2.0 0.0.0.31
+ permit 10.40.2.0 0.0.0.31
+ permit 10.255.0.0 0.0.3.255
+ deny   any log
+!
+! --- AAA: centralised TACACS+ with local fallback (Task 6) ---
+aaa new-model
+tacacs server TAC1
+ address ipv4 10.10.2.130
+ key GulfTechTacKey2026
+ timeout 3
+aaa group server tacacs+ TACACS-GRP
+ server name TAC1
+ip tacacs source-interface Vlan99
+aaa authentication login VTY-AUTH group TACACS-GRP local
+aaa authentication login CON-AUTH local
+aaa authorization exec VTY-AUTHZ group TACACS-GRP local
+aaa authorization exec CON-AUTHZ local
+aaa accounting exec ACC-EXEC start-stop group TACACS-GRP
+aaa accounting commands 1 ACC-CMD1 start-stop group TACACS-GRP
+aaa accounting commands 15 ACC-CMD15 start-stop group TACACS-GRP
+aaa session-id common
+!
+line con 0
+ login authentication CON-AUTH
+ authorization exec CON-AUTHZ
+ exec-timeout 5 0
+ logging synchronous
+line vty 0 4
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ accounting commands 1 ACC-CMD1
+ accounting commands 15 ACC-CMD15
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+ logging synchronous
+line vty 5 15
+ login authentication VTY-AUTH
+ authorization exec VTY-AUTHZ
+ accounting exec ACC-EXEC
+ access-class VTY-ACL in
+ transport input ssh
+ exec-timeout 5 0
+end
+write memory
+
+
+####################################################################################################
+# SECTION 6 - HOSTS, SERVERS, IDS, ATTACKER, PCs (Tasks 2, 4)
+####################################################################################################
+
+====================================================================================================
+>>> DEVICE: DMZ-SRV    PLATFORM: Linux (Ubuntu)
+>>> Terminal of DMZ-SRV (web + mail hardening, Task 2/Web&Email requirement)
+====================================================================================================
+# --- Network: two service addresses on one NIC (web .10, mail .11) ---
+sudo ip link set ens3 up
+sudo ip addr add 10.10.3.10/27 dev ens3
+sudo ip addr add 10.10.3.11/27 dev ens3
+sudo ip route add default via 10.10.3.1
+# --- One-time install (temporarily attach a NAT/Cloud node for internet) ---
+echo "postfix postfix/main_mailer_type select Internet Site" | sudo debconf-set-selections
+echo "postfix postfix/mailname string mail.gulftech.local"   | sudo debconf-set-selections
+sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx postfix fail2ban ufw openssl
+# --- TLS certificate (self-signed for the lab) ---
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/gulftech.key -out /etc/ssl/certs/gulftech.crt \
+  -subj "/C=BH/O=GulfTech Solutions/CN=www.gulftech.local"
+# --- NGINX hardening: no version leak, rate limiting, modern TLS, security headers ---
+sudo tee /etc/nginx/conf.d/hardening.conf >/dev/null <<'EOF'
+server_tokens off;
+limit_req_zone $binary_remote_addr zone=perip:10m rate=10r/s;
+limit_conn_zone $binary_remote_addr zone=connperip:10m;
+client_body_timeout 10s;
+client_header_timeout 10s;
+keepalive_timeout 15s;
+send_timeout 10s;
+client_max_body_size 1m;
+EOF
+sudo tee /etc/nginx/sites-available/default >/dev/null <<'EOF'
+server {
+    listen 10.10.3.10:80 default_server;
+    server_name www.gulftech.local;
+    location / { return 301 https://$host$request_uri; }
+}
+server {
+    listen 10.10.3.10:443 ssl default_server;
+    server_name www.gulftech.local;
+    ssl_certificate     /etc/ssl/certs/gulftech.crt;
+    ssl_certificate_key /etc/ssl/private/gulftech.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Content-Security-Policy "default-src 'self'" always;
+    limit_req zone=perip burst=20 nodelay;
+    limit_conn connperip 20;
+    root /var/www/html;
+    index index.html;
+}
+EOF
+echo "<h1>GulfTech Solutions - DMZ web</h1>" | sudo tee /var/www/html/index.html
+sudo nginx -t && sudo systemctl restart nginx
+# --- Postfix hardening ---
+sudo postconf -e 'smtpd_banner = $myhostname ESMTP'
+sudo postconf -e 'disable_vrfy_command = yes'
+sudo postconf -e 'smtpd_helo_required = yes'
+sudo postconf -e 'smtpd_tls_security_level = may'
+sudo postconf -e 'smtpd_tls_cert_file = /etc/ssl/certs/gulftech.crt'
+sudo postconf -e 'smtpd_tls_key_file = /etc/ssl/private/gulftech.key'
+sudo postconf -e 'smtpd_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1'
+sudo postconf -e 'smtpd_relay_restrictions = permit_mynetworks, reject_unauth_destination'
+sudo postconf -e 'smtpd_recipient_restrictions = permit_mynetworks, reject_unauth_destination, reject_non_fqdn_recipient'
+sudo postconf -e 'smtpd_client_connection_rate_limit = 20'
+sudo postconf -e 'smtpd_client_message_rate_limit = 60'
+sudo postconf -e 'smtpd_error_sleep_time = 5s'
+sudo postconf -e 'inet_interfaces = 10.10.3.11, 127.0.0.1'
+sudo systemctl restart postfix
+# --- Host firewall + brute-force protection ---
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow to 10.10.3.10 port 80 proto tcp
+sudo ufw allow to 10.10.3.10 port 443 proto tcp
+sudo ufw allow to 10.10.3.11 port 25 proto tcp
+sudo ufw allow from 10.10.2.160/27 to any port 22 proto tcp
+sudo ufw --force enable
+sudo tee /etc/fail2ban/jail.local >/dev/null <<'EOF'
+[DEFAULT]
+bantime  = 600
+findtime = 120
+maxretry = 3
+[sshd]
+enabled = true
+[nginx-limit-req]
+enabled = true
+EOF
+sudo systemctl restart fail2ban
+
+====================================================================================================
+>>> DEVICE: IDS-TAP-01    PLATFORM: Linux (Ubuntu) 2 NICs
+>>> Terminal of IDS-TAP-01 (Suricata passive, behaviour-based IDS, Task 4)
+====================================================================================================
+# --- Network: ens3 = SPAN capture NIC (NO IP), ens4 = management NIC ---
+sudo ip link set ens3 up promisc on
+sudo ethtool -K ens3 gro off lro off tso off gso off rx off tx off 2>/dev/null
+sudo ip link set ens4 up
+sudo ip addr add 10.10.2.140/27 dev ens4
+sudo ip route add default via 10.10.2.129
+# --- One-time install (temporarily attach a NAT/Cloud node for internet) ---
+sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y suricata jq
+# --- Tell Suricata what 'HOME_NET' is (internal + published perimeter prefix) ---
+sudo sed -i 's|^\( *HOME_NET:\).*|\1 "[10.10.0.0/16,192.0.2.0/28]"|' /etc/suricata/suricata.yaml
+sudo grep -n "HOME_NET:" /etc/suricata/suricata.yaml | head -3
+# --- BEHAVIOUR-BASED rules: they alarm on RATE / PATTERN OF BEHAVIOUR per source, not on a payload signature ---
+sudo mkdir -p /etc/suricata/rules
+sudo tee /etc/suricata/rules/local.rules >/dev/null <<'EOF'
+# GT-1 Port-scan behaviour: one source opening many new TCP connections in a few seconds
+alert tcp $EXTERNAL_NET any -> $HOME_NET any (msg:"GT-BEHAVIOR Possible TCP port scan (SYN rate per source)"; flow:stateless; flags:S,12; threshold:type both, track by_src, count 30, seconds 5; classtype:attempted-recon; sid:1000001; rev:1;)
+# GT-2 SYN-flood behaviour against published services
+alert tcp $EXTERNAL_NET any -> $HOME_NET [25,80,443] (msg:"GT-BEHAVIOR SYN flood suspected (SYN rate per destination)"; flow:stateless; flags:S,12; threshold:type both, track by_dst, count 300, seconds 5; classtype:attempted-dos; sid:1000002; rev:1;)
+# GT-3 ICMP flood behaviour
+alert icmp $EXTERNAL_NET any -> $HOME_NET any (msg:"GT-BEHAVIOR ICMP flood suspected"; itype:8; threshold:type both, track by_src, count 100, seconds 5; classtype:attempted-dos; sid:1000003; rev:1;)
+# GT-4 SSH brute-force behaviour: repeated new connections to TCP/22
+alert tcp $EXTERNAL_NET any -> $HOME_NET 22 (msg:"GT-BEHAVIOR SSH brute-force (new-connection rate)"; flow:stateless; flags:S,12; threshold:type both, track by_src, count 5, seconds 60; classtype:attempted-admin; sid:1000004; rev:1;)
+# GT-5 HTTP request burst (L7 DoS / content scanning behaviour)
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"GT-BEHAVIOR HTTP request burst (scan or L7 DoS)"; flow:established,to_server; http.method; content:"GET"; threshold:type both, track by_src, count 50, seconds 10; classtype:web-application-attack; sid:1000005; rev:1;)
+# GT-6 Lateral-movement / policy behaviour: DMZ must never initiate traffic to the internal LAN
+alert ip 10.10.3.0/27 any -> [10.10.1.0/24,10.10.2.0/24] any (msg:"GT-POLICY DMZ host attempting to reach internal LAN (lateral movement)"; threshold:type limit, track by_src, count 1, seconds 60; classtype:policy-violation; sid:1000006; rev:1;)
+# GT-7 Compromised-host behaviour: outbound SYN burst from DMZ (scan / beaconing)
+alert tcp 10.10.3.0/27 any -> any any (msg:"GT-BEHAVIOR DMZ host outbound SYN burst (scan/beacon)"; flow:stateless; flags:S,12; threshold:type both, track by_src, count 40, seconds 10; classtype:trojan-activity; sid:1000007; rev:1;)
+EOF
+# --- Validate then start (IDS mode, reading the SPAN NIC) ---
+sudo suricata -T -c /etc/suricata/suricata.yaml -S /etc/suricata/rules/local.rules
+sudo suricata -c /etc/suricata/suricata.yaml -S /etc/suricata/rules/local.rules --af-packet=ens3 -k none -D
+sleep 5; sudo tail -n 5 /var/log/suricata/suricata.log
+# --- Watch alerts ---
+#   sudo tail -f /var/log/suricata/fast.log
+#   sudo jq -c 'select(.event_type=="alert") | [.timestamp,.src_ip,.dest_ip,.alert.signature]' /var/log/suricata/eve.json | tail -20
+# NOTE: this sensor is a PASSIVE IDS (SPAN). It detects and logs; it does NOT drop packets.
+#       Containment is performed on the ASA (shun) - see Task 4 response commands.
+
+====================================================================================================
+>>> DEVICE: ATTACKER    PLATFORM: Kali Linux
+>>> Terminal of ATTACKER
+====================================================================================================
+# Kali Linux (ATTACKER)
+sudo ip link set eth0 up
+sudo ip addr add 203.0.113.18/24 dev eth0
+sudo ip route add default via 203.0.113.1
+ping -c 2 203.0.113.1
+# (tools used later: nmap, hping3, hydra, nikto, curl are preinstalled on Kali)
+
+====================================================================================================
+>>> DEVICE: INET-WEB    PLATFORM: Linux
+>>> Terminal of INET-WEB
+====================================================================================================
+# INET-WEB: 'approved research portal' = the ONLY Internet destination R&D may reach (TCP/443, real TLS).
+# A plain :80 listener is added for the negative test.
+sudo ip link set ens3 up
+sudo ip addr add 203.0.113.19/24 dev ens3
+sudo ip route add default via 203.0.113.1
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /tmp/portal.key -out /tmp/portal.crt -subj "/C=XX/O=Approved Research Portal/CN=portal.example"
+sudo nohup openssl s_server -accept 443 -cert /tmp/portal.crt -key /tmp/portal.key -www >/dev/null 2>&1 &
+sudo mkdir -p /tmp/web && echo "plain http" | sudo tee /tmp/web/index.html >/dev/null
+cd /tmp/web && sudo nohup python3 -m http.server 80 --bind 203.0.113.19 >/dev/null 2>&1 &
+# Negative-test listener on the ATTACKER (a NON-approved TLS destination on 443), run on Kali:
+#   openssl req -x509 -nodes -days 1 -newkey rsa:2048 -keyout /tmp/k.key -out /tmp/k.crt -subj "/CN=evil"
+#   sudo openssl s_server -accept 443 -cert /tmp/k.crt -key /tmp/k.key -www &
+
+====================================================================================================
+>>> DEVICE: ADMIN-PC    PLATFORM: Linux
+>>> Terminal of ADMIN-PC
+====================================================================================================
+# ADMIN-PC workstation (management VLAN 99, static address)
+sudo ip link set ens3 up
+sudo ip addr add 10.10.2.170/27 dev ens3
+sudo ip route add default via 10.10.2.161
+# LAB COMPATIBILITY WORKAROUND ONLY (not a production setting): modern OpenSSH disables the legacy algorithms the
+# IOSv SSH server offers, so they are re-enabled for this client alias only:
+alias gtssh='ssh -oKexAlgorithms=+diffie-hellman-group14-sha1 -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa -oStrictHostKeyChecking=no'
+
+====================================================================================================
+>>> DEVICE: DXB-USER-01    PLATFORM: Linux
+>>> Terminal of DXB-USER-01
+====================================================================================================
+# DXB-USER-01 workstation (management VLAN 99, static address)
+sudo ip link set ens3 up
+sudo ip addr add 10.20.2.10/27 dev ens3
+sudo ip route add default via 10.20.2.1
+# LAB COMPATIBILITY WORKAROUND ONLY (not a production setting): modern OpenSSH disables the legacy algorithms the
+# IOSv SSH server offers, so they are re-enabled for this client alias only:
+alias gtssh='ssh -oKexAlgorithms=+diffie-hellman-group14-sha1 -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa -oStrictHostKeyChecking=no'
+
+====================================================================================================
+>>> DEVICE: RUH-USER-01    PLATFORM: Linux
+>>> Terminal of RUH-USER-01
+====================================================================================================
+# RUH-USER-01 workstation (management VLAN 99, static address)
+sudo ip link set ens3 up
+sudo ip addr add 10.30.2.10/27 dev ens3
+sudo ip route add default via 10.30.2.1
+# LAB COMPATIBILITY WORKAROUND ONLY (not a production setting): modern OpenSSH disables the legacy algorithms the
+# IOSv SSH server offers, so they are re-enabled for this client alias only:
+alias gtssh='ssh -oKexAlgorithms=+diffie-hellman-group14-sha1 -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa -oStrictHostKeyChecking=no'
+
+====================================================================================================
+>>> DEVICE: DOH-USER-01    PLATFORM: Linux
+>>> Terminal of DOH-USER-01
+====================================================================================================
+# DOH-USER-01 workstation (management VLAN 99, static address)
+sudo ip link set ens3 up
+sudo ip addr add 10.40.2.10/27 dev ens3
+sudo ip route add default via 10.40.2.1
+# LAB COMPATIBILITY WORKAROUND ONLY (not a production setting): modern OpenSSH disables the legacy algorithms the
+# IOSv SSH server offers, so they are re-enabled for this client alias only:
+alias gtssh='ssh -oKexAlgorithms=+diffie-hellman-group14-sha1 -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa -oStrictHostKeyChecking=no'
+
+====================================================================================================
+>>> DEVICE: ROGUE-DEV    PLATFORM: Kali Linux
+>>> Terminal of ROGUE-DEV
+====================================================================================================
+# ROGUE-DEV (Kali) - plugged into HQ-ACC-SW1 Gi1/1 (VLAN 30) to exercise the Layer-2 controls (Task 2)
+# Boot ORDER matters for the addresses shown in the topology: start SALES-PC first so it receives 10.10.1.10.
+sudo ip link set eth0 up
+# legitimate lease (before the attacks):
+sudo dhclient -v eth0
+ip -br addr show eth0
+
+====================================================================================================
+>>> DEVICE: RND-PC    PLATFORM: Linux
+>>> Terminal of RND-PC
+====================================================================================================
+# RND-PC (Linux, R&D VLAN 50) - gets its address by DHCP from HQ-CORE
+sudo ip link set ens3 up
+sudo dhclient -v ens3
+ip -br addr show ens3
+
+====================================================================================================
+>>> DEVICE: VPCS nodes    PLATFORM: VPCS
+>>> Each VPCS console
+====================================================================================================
+# VPCS nodes (type on the VPCS console). DHCP is used so DHCP-snooping bindings exist for DAI / IP-source-guard.
+HR-PC>      ip dhcp
+MKT-PC>     ip dhcp
+SALES-PC>   ip dhcp
+# Branch PCs likewise:  DXB-HR-PC> ip dhcp   DXB-MKT-PC> ip dhcp   DXB-SALES-PC> ip dhcp   (same for RUH-* and DOH-*)
+# Verify:   show ip
+# Save:     save
+
+
+####################################################################################################
+# SECTION 7 - RBAC / CLI VIEWS (Task 6)  -  run on EVERY router and switch
+# Devices: HQ-R1 DXB-R1 RUH-R1 DOH-R1 HQ-CORE-SW1 HQ-ACC-SW1 HQ-PSW DXB-SW1 RUH-SW1 DOH-SW1
+# Step A is typed by hand: "enable view" prompts for the enable secret (GulfTechEnable2026).
+####################################################################################################
+! ==== STEP A (type manually - it prompts for the enable secret):  enable view
+! ==== STEP B (then paste the block below while in the ROOT view)
+configure terminal
+parser view NOC-VIEW
+ secret NocViewSecret2026
+ commands exec include all show ip
+ commands exec include all show interfaces
+ commands exec include show version
+ commands exec include show logging
+ commands exec include show clock
+ commands exec include all ping
+ commands exec include all traceroute
+ commands exec include all terminal
+ commands exec include exit
+parser view AUDIT-VIEW
+ secret AuditViewSecret2026
+ commands exec include all show
+ commands exec include all terminal
+ commands exec include exit
+exit
+username noc view NOC-VIEW secret GulfTechNoc2026
+username auditor view AUDIT-VIEW secret GulfTechAudit2026
+end
+write memory
+
+
+####################################################################################################
+# SECTION 8 - SAVE EVERYTHING
+# Run on every IOS node:  write memory    |   ASA-FW1:  write memory (replicates to FW2 automatically)
+# Export configs for Moodle submission: EVE-NG > node > 'Export CFG', or:  show running-config  (copy into .txt)
+####################################################################################################
+
+
+####################################################################################################
+# SECTION 9 - VERIFICATION, ATTACK SIMULATION AND FAILOVER TESTS (evidence for report screenshots)
+####################################################################################################
+
+----------------------------------------------------------------------------------------------------
+[ TASK 1 - addressing / VLAN verification ]
+----------------------------------------------------------------------------------------------------
+-- HQ-CORE-SW1 / HQ-ACC-SW1 / HQ-PSW / branch switches --
+show vlan brief
+show interfaces trunk
+show ip interface brief
+show spanning-tree summary
+-- HQ-CORE-SW1 --
+show ip route
+show ip dhcp binding
+show running-config interface Vlan50
+-- every router --
+show ip interface brief
+show ip route
+show running-config | section dhcp
+-- ASA --
+show interface ip brief
+show nameif
+show route
+show nat detail
+-- Reachability matrix (VPCS / Linux) --
+HR-PC>        ping 10.10.2.65             (HR -> MKT, routed on HQ-CORE-SW1)
+SALES-PC>     ping 10.10.2.130            (SALES -> TACACS-SRV, VLAN 60)
+DXB-SALES-PC> ping 10.10.2.130            (branch -> real HQ server over the VPN; permitted by the ASA OUTSIDE_IN ICMP rule)
+-- Record the real leases and compare with the topology diagram --
+HQ-CORE-SW1# show ip dhcp binding
+
+----------------------------------------------------------------------------------------------------
+[ TASK 2 - L2/L3 hardening tests ]
+----------------------------------------------------------------------------------------------------
+-- (A) Rogue DHCP server  (ROGUE-DEV on HQ-ACC-SW1 Gi1/1, VLAN 30) --
+sudo ip addr add 10.10.1.99/25 dev eth0
+sudo dnsmasq -C /dev/null -d -i eth0 --dhcp-range=10.10.1.100,10.10.1.120,255.255.255.128,1h --dhcp-option=3,10.10.1.99
+SALES-PC> ip dhcp -r            (the client must still receive the legitimate 10.10.1.x lease / gateway 10.10.1.1)
+-- HQ-ACC-SW1 --
+show ip dhcp snooping
+show ip dhcp snooping binding
+show ip dhcp snooping statistics
+show logging | include DHCP_SNOOPING
+
+-- (B) ARP spoofing / MITM (ROGUE-DEV with a legitimate lease: sudo dhclient eth0) --
+sudo arpspoof -i eth0 -t <SALES-PC-IP> 10.10.1.1
+-- HQ-ACC-SW1 --
+show ip arp inspection vlan 30
+show ip arp inspection statistics vlan 30
+show logging | include SW_DAI
+
+-- (C) Unauthorised MAC on a secured port (ROGUE-DEV) --
+sudo macchanger -r eth0 && sudo ip link set eth0 down && sudo ip link set eth0 up
+-- HQ-ACC-SW1 --
+show port-security interface GigabitEthernet1/1
+show interfaces status err-disabled
+show port-security address
+
+-- (D) Broadcast storm (ROGUE-DEV) --
+sudo ip route add 255.255.255.255 dev eth0 2>/dev/null
+sudo timeout 20 hping3 -2 -p 9999 -i u100 255.255.255.255        (finite, controlled)
+-- HQ-ACC-SW1 --
+show storm-control broadcast
+show interfaces status err-disabled
+show logging | include STORM
+
+-- (E) ACLs: R&D isolation (HQ-CORE-SW1) --
+show access-lists RD-IN
+show access-lists RD-OUT
+SALES-PC> ping <RND-PC-IP>                                                      (must FAIL - RD-OUT denies)
+RND-PC$ ping -c 2 10.10.2.65                                                    (must FAIL - RD-IN denies RFC1918)
+RND-PC$ nc -zv -w 3 10.10.2.130 22                                              (must SUCCEED - TCP/22 to the servers VLAN is permitted)
+RND-PC$ curl -k -m 5 -s -o /dev/null -w "%{http_code}\n" https://203.0.113.19/   (SUCCEED - approved portal, TCP/443 with real TLS)
+RND-PC$ curl -m 5 -s -o /dev/null -w "%{http_code}\n" http://203.0.113.19:80/    (FAIL - blocked by RD-IN: only TCP/443 leaves)
+RND-PC$ curl -k -m 5 -s -o /dev/null -w "%{http_code}\n" https://203.0.113.18/   (FAIL at the ASA - not the approved portal; needs the TLS listener on ATTACKER)
+-- ASA --
+show access-list INSIDE_IN | include 10.10.1.128|RND
+
+-- (F) Anti-spoofing / DDoS (L3) --
+-- ATTACKER: spoofed INTERNAL source -> dropped by uRPF on HQ-R1
+sudo hping3 -a 10.10.1.130 -S -p 80 -c 5 192.0.2.10
+-- ATTACKER: spoofed RFC1918 source that uRPF cannot judge -> dropped by the bogon ACL
+sudo hping3 -a 172.16.9.9 -S -p 80 -c 5 192.0.2.10
+-- HQ-R1 --
+show ip interface GigabitEthernet0/1 | include verification|drops|access list
+show access-lists WAN-IN-1
+show policy-map control-plane
+-- ATTACKER: controlled SYN burst against the published web server (finite - reproducible) --
+sudo hping3 -S -p 80 -i u1000 -c 3000 192.0.2.10
+-- ASA --
+show service-policy interface outside
+show conn count
+show threat-detection rate
+
+-- (G) Device hardening evidence (each device) --
+show ip ssh
+show running-config | include service|no ip http|no ip source-route|login block|banner|exec-timeout
+show login
+show running-config | section line vty
+
+----------------------------------------------------------------------------------------------------
+[ TASK 3 - VPN verification + failover ]
+----------------------------------------------------------------------------------------------------
+-- Tunnel health (HQ-R1) --
+show crypto ikev2 sa
+show crypto ikev2 sa detail | include Encr|Hash|DH|Auth
+show crypto ipsec sa | include peer|encaps|decaps|local ident|remote ident
+show interfaces Tunnel11 | include line protocol|Tunnel protocol|Tunnel source|destination
+show ip eigrp neighbors
+show ip route eigrp
+-- Each spoke --
+show crypto ikev2 sa
+show crypto ipsec sa | include encaps|decaps
+show ip eigrp neighbors
+show ip route 10.10.0.0
+show ip route 10.30.0.0         (branch-to-branch is routed via the HQ hub; use 10.20/10.40 on RUH/DOH)
+-- Branch-to-branch + branch-to-HQ connectivity --
+DXB-SALES-PC> ping <RUH-SALES-PC-IP>
+DXB-R1# ping 10.30.1.1 source GigabitEthernet0/0.30
+DXB-R1# traceroute 10.10.2.161 source Loopback0
+-- Prove encryption: capture on the ISP1 <-> DXB-R1 link in EVE-NG (right-click link > Capture) while pinging.
+   Wireshark filters:  esp   (payload unreadable)    and    icmp  (must show NO clear-text ICMP on the WAN link)
+-- FAILOVER TEST 1: spoke primary-link cut (record the OBSERVED detection and recovery times) --
+DXB-SALES-PC> ping 10.10.2.130 -t            (leave running; note the first and last lost reply)
+ISP1# configure terminal
+ISP1(config)# interface GigabitEthernet0/1
+ISP1(config-if)# shutdown
+DXB-R1# show ip eigrp neighbors              (Tunnel1 neighbour is removed when the 9 s hold-time expires; Tunnel2 remains)
+DXB-R1# show ip route 10.10.0.0               (next-hop should now be 10.255.2.1 via Tunnel2)
+ISP1(config-if)# no shutdown                  (restore; confirm the route returns to Tunnel1)
+-- FAILOVER TEST 2: HQ ISP1 failure (affects every spoke + the Internet default route) --
+HQ-R1(config)# interface GigabitEthernet0/1
+HQ-R1(config-if)# shutdown
+HQ-R1# show ip route 0.0.0.0                 (default should now be via 192.0.2.17, AD 250)
+HQ-R1# show ip eigrp neighbors               (spokes should now be reached via Tunnel21/22/23)
+HQ-R1(config-if)# no shutdown
+
+----------------------------------------------------------------------------------------------------
+[ TASK 4 - IDS/IPS attack simulation ]
+----------------------------------------------------------------------------------------------------
+-- Start the sensor (see IDS-TAP-01 block) then tail the alerts --
+IDS-TAP-01$ sudo tail -f /var/log/suricata/fast.log
+-- Attack simulations from ATTACKER (Kali) against the published web/mail range --
+# 1) Port scan                      -> GT-1
+sudo nmap -sS -T4 -p 1-1000 192.0.2.10
+# 2) SYN burst                      -> GT-2   (finite)
+sudo hping3 -S -p 80 -i u1000 -c 3000 192.0.2.10
+# 3) ICMP burst                     -> GT-3   (finite)
+sudo hping3 --icmp -i u1000 -c 2000 192.0.2.10
+# 4) SSH brute-force behaviour      -> GT-4   (connection-rate pattern only)
+for i in $(seq 1 12); do timeout 2 nc -w 1 192.0.2.10 22; done
+# 5) HTTP request burst / scan      -> GT-5
+for i in $(seq 1 120); do curl -s -o /dev/null http://192.0.2.10/$RANDOM; done
+-- Compromised-DMZ simulation from DMZ-SRV --
+# 6) lateral movement               -> GT-6        (the ASA must ALSO block it)
+ping -c 3 10.10.1.130
+# 7) outbound scan                  -> GT-7
+sudo nmap -sS -T4 -p 1-200 203.0.113.19
+-- Correlate (IDS-TAP-01) --
+sudo jq -c 'select(.event_type=="alert") | [.timestamp,.src_ip,.dest_ip,.alert.signature]' /var/log/suricata/eve.json | tail -40
+sudo grep -c "GT-BEHAVIOR" /var/log/suricata/fast.log
+-- Escalation / containment: Suricata ALERTS ONLY (passive IDS). The analyst contains the source on the ASA: --
+shun 203.0.113.18
+show shun
+show shun statistics
+no shun 203.0.113.18
+-- Re-run the scan after the shun to prove containment, then remove the shun. --
+
+----------------------------------------------------------------------------------------------------
+[ TASK 5 - firewall zones + HA failover ]
+----------------------------------------------------------------------------------------------------
+-- HA state (both units) --
+show failover
+show failover state
+show failover history
+show failover interface
+show interface ip brief
+-- Zone policy --
+show nat detail
+show xlate
+show access-list OUTSIDE_IN
+show access-list INSIDE_IN
+show access-list DMZ_IN
+-- NAT verification (do not trust successful parsing - prove the translation order) --
+packet-tracer input inside tcp 10.10.1.10 40000 203.0.113.19 443 detailed        (expect the PAT rule, source becomes 192.0.2.1)
+packet-tracer input outside tcp 10.255.0.2 40000 10.10.2.130 49 detailed         (branch loopback -> TACACS: identity NAT / no translation, ALLOW)
+packet-tracer input outside tcp 203.0.113.18 40000 10.10.3.10 443 detailed       (static NAT to 192.0.2.10, ALLOW)
+packet-tracer input outside tcp 203.0.113.18 40000 10.10.1.130 443 detailed      (R&D: DROP in the ACCESS-LIST phase)
+-- Positive / negative tests --
+ATTACKER$ curl -k -m 5 -s -o /dev/null -w "%{http_code}\n" https://192.0.2.10/       (EXTERNAL -> DMZ web : allowed)
+ATTACKER$ nc -zv -w 3 192.0.2.10 22                                                    (EXTERNAL -> DMZ ssh : blocked)
+DMZ-SRV$  ping -c 2 10.10.2.130                                                        (DMZ -> INSIDE : blocked)
+-- FAILOVER TEST A: forced switch-over while traffic flows (record the OBSERVED loss and recovery time) --
+SALES-PC> ping 203.0.113.19 -t                 (leave running; a small number of packets may be lost - count them)
+ASA-active# no failover active                 (this unit becomes Standby)
+ASA# show failover                             (roles swapped; stateful link statistics increment)
+ASA# show conn | include 203.0.113.19
+ASA-newactive# failover active                 (optional: give the role back)
+-- FAILOVER TEST B: interface-monitoring fail-over --
+HQ-PSW(config)# interface GigabitEthernet0/1   (FW1 outside port)
+HQ-PSW(config-if)# shutdown
+ASA# show failover history                     (reason should be an interface check; FW2 becomes Active)
+HQ-PSW(config-if)# no shutdown
+-- FAILOVER TEST C: unit failure --
+Power off the ACTIVE ASA node in EVE-NG. The unit holdtime is 3 s - record the time the survivor really takes to become Active.
+
+----------------------------------------------------------------------------------------------------
+[ TASK 6 - AAA + RBAC tests ]
+----------------------------------------------------------------------------------------------------
+-- TACACS+ reachability (each device) --
+test aaa group TACACS-GRP netadmin GulfTechAdmin2026 new-code
+show aaa servers                (availability of 'show aaa servers' / 'show tacacs' differs by IOS version - the test above matters more)
+show tacacs
+-- ROLE 1: netadmin (TACACS+ priv-lvl 15) from ADMIN-PC --
+gtssh netadmin@10.10.2.161
+show privilege                 (privilege level 15)
+configure terminal             (allowed)
+-- ROLE 2 / ROLE 3  ==  *** MANDATORY RUNTIME VERIFICATION - TEST A: TACACS+ user -> CLI view ***
+gtssh noc@10.10.2.161
+show parser view               (does it report NOC-VIEW?)
+show privilege
+show ip interface brief        (allowed in NOC-VIEW)
+ping 10.10.2.1                 (allowed in NOC-VIEW)
+show running-config            (denied in NOC-VIEW)
+configure terminal             (denied)
+gtssh auditor@10.10.2.161
+show parser view               (does it report AUDIT-VIEW?)
+show running-config            (allowed in AUDIT-VIEW)
+ping 10.10.2.1                 (denied in AUDIT-VIEW)
+-- RESULT RULE:  if TACACS+ users land in the parser views -> centralised view assignment works: screenshot it.
+                 if they land at privilege 1 with no view (image ignores cli-view-name) -> RECORD that outcome honestly and use
+                 TEST B below as the CLI-view RBAC evidence (the TACACS+ users are still authenticated, authorised for EXEC and accounted).
+-- TEST B: local view accounts (always valid) - console, or SSH while TACACS+ is stopped --
+TACACS-SRV$ sudo systemctl stop tacacs_plus
+gtssh noc@10.10.2.161          (method list falls back to 'local' -> NOC-VIEW enforced)
+show parser view ; show ip interface brief ; show running-config ; configure terminal
+gtssh auditor@10.10.2.161      (AUDIT-VIEW enforced)
+TACACS-SRV$ sudo systemctl start tacacs_plus
+-- Verify the views --
+show parser view all           (as root view: 'enable view')
+-- Accounting evidence --
+TACACS-SRV$ sudo tail -n 30 /var/log/tac_plus.acct
+-- Brute-force protection: three wrong passwords --
+show login
+
+----------------------------------------------------------------------------------------------------
+[ TASK 7 - end-to-end scenarios ]
+----------------------------------------------------------------------------------------------------
+======== SCENARIO 1 : remote administrator at Dubai -> HQ-CORE-SW1 through VPN + firewall + AAA/RBAC ========
+DXB-USER-01$ ping -c 3 10.10.2.161
+DXB-USER-01$ traceroute -n 10.10.2.161
+DXB-USER-01$ gtssh noc@10.10.2.161                    (leave the session open)
+-- Layer 1 : branch LAN/VLAN (Task 1)   --   DXB-SW1# show vlan brief | include MANAGEMENT
+-- Layer 2 : IPsec tunnel (Task 3)      --   DXB-R1#  show crypto ipsec sa | include encaps|decaps
+                                              HQ-R1#  show crypto ikev2 sa
+-- Layer 3 : perimeter ACL / uRPF (T2)  --   HQ-R1#  show access-lists WAN-IN-1
+-- Layer 4 : ASA zone policy (Task 5)   --   ASA# show conn | include 10.20.2.10
+                                              ASA# show access-list OUTSIDE_IN | include ssh
+                                              ASA# packet-tracer input outside tcp 10.20.2.10 50000 10.10.2.161 22 detailed
+-- Layer 5 : VTY-ACL + AAA + RBAC (T6)  --   HQ-CORE-SW1# show users
+                                              TACACS-SRV$ sudo tail -n 20 /var/log/tac_plus.acct
+-- Capture: Wireshark on the DXB-R1 Gi0/1 link (ESP only) and on the HQ-R1 Gi0/0 link (decrypted 10.20.2.10 -> 10.10.2.161 TCP/22).
+
+======== SCENARIO 2 : external attacker -> isolated R&D subnet ========
+-- 2a  Direct attempt to the private R&D address (simulate a hostile/leaky ISP route) --
+ISP1(config)# ip route 10.10.1.128 255.255.255.128 198.51.100.2
+ATTACKER$ sudo ip route add 10.10.1.128/25 via 203.0.113.1
+ATTACKER$ ping -c 3 10.10.1.130 ; nmap -Pn -p 22,443 10.10.1.130
+HQ-R1# show access-lists WAN-IN-1                     (deny counters rise: only 192.0.2.0/28 is permitted)
+-- 2b  Scan of the published range --
+ATTACKER$ sudo nmap -sS -p 1-1000 192.0.2.0/28
+ASA#  show access-list OUTSIDE_IN                     (denied hit counts)
+ASA#  show logging | include 106023|106100
+ASA#  packet-tracer input outside tcp 203.0.113.18 40000 10.10.1.130 443 detailed
+-- 2c  Pivot from a compromised DMZ server --
+DMZ-SRV$ ping -c 3 10.10.1.130 ; nc -zv -w 3 10.10.1.130 22
+ASA#  show access-list DMZ_IN                         (deny ip DMZ-NET -> OG-HQ-INTERNAL counters)
+IDS-TAP-01$ grep -E "GT-POLICY|GT-BEHAVIOR" /var/log/suricata/fast.log | tail
+-- 2d  From an internal non-R&D host --
+SALES-PC> ping <RND-PC-IP>                            (denied)
+HQ-CORE-SW1# show access-lists RD-OUT
+-- cleanup --
+ISP1(config)# no ip route 10.10.1.128 255.255.255.128 198.51.100.2
+ATTACKER$ sudo ip route del 10.10.1.128/25
+
+======== SCENARIO 3 : link or firewall failure MID-SESSION  (record what you OBSERVE - do not assume the outcome) ========
+DXB-USER-01$ gtssh noc@10.10.2.161                    (session A - leave open, run: show clock  repeatedly)
+SALES-PC> ping 203.0.113.19 -t                        (session B through the ASA)
+-- 3a  Branch link failure --
+ISP1(config)# interface GigabitEthernet0/1 ; shutdown
+DXB-R1# show ip eigrp neighbors ; show ip route 10.10.0.0 ; show crypto ikev2 sa
+(Observe how long session A is interrupted and whether the existing SSH session survives the re-convergence onto Tunnel2.)
+ISP1(config-if)# no shutdown
+-- 3b  Firewall failure --
+ASA-active# no failover active
+ASA# show failover ; show conn | include 10.20.2.10
+(Observe whether sessions A and B continue; stateful failover replicates the connection table. Record loss and recovery time.)
+-- 3c  Hard failure of the active firewall: power off the node in EVE-NG, observe the ping loss and  show failover  on the survivor --
